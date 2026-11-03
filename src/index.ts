@@ -80,6 +80,7 @@ async function main() {
         fast_model: llmConfig.fast.model,
         strong_model: llmConfig.strong?.model ?? llmConfig.fast.model,
         fallback_models: llmConfig.fallback_models,
+        providers: (config as any).providers,
       });
     } else {
       llm = new LLMRouter({
@@ -88,6 +89,7 @@ async function main() {
         fast_model: llmConfig.fast_model,
         strong_model: llmConfig.strong_model,
         fallback_models: llmConfig.fallback_models,
+        providers: (config as any).providers,
       });
     }
     console.log("✅ LLM подключён");

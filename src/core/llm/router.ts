@@ -1,6 +1,7 @@
 import type { LLMClient, LLMMessage, LLMResponse, ToolDefinition, StreamCallback } from "./types.js";
 import { createOpenRouterClient } from "./providers/openrouter.js";
 import { isBillingError, isRateLimitError, checkBalance } from "./providers/openrouter.js";
+import { createCompatClient } from "./providers/openai-compat.js";
 
 const DEFAULT_FALLBACKS = [
   "openrouter/free",
@@ -9,6 +10,40 @@ const DEFAULT_FALLBACKS = [
   "mistralai/mistral-small-3.1-24b-instruct:free",
   "meta-llama/llama-3.3-70b-instruct:free",
 ];
+
+/**
+ * Hosts that speak the OpenAI chat protocol, by provider name.
+ *
+ * The address used to be a literal inside the OpenRouter client, which was correct
+ * while it was the only provider. The owner's arrangement (03.11) is chat through
+ * OpenCode Go, which is a *subscription* gateway at its own path and additionally
+ * demands `x-opencode-session`; Google AI Studio serves the same protocol at
+ * `/v1beta/openai`. A provider whose address is not listed here can still be used by
+ * giving `base_url` in the config — that is what makes the third provider a config
+ * line rather than a code change.
+ */
+const PROVIDER_BASE_URLS: Record<string, string> = {
+  openrouter: "https://openrouter.ai/api/v1",
+  opencode: "https://opencode.ai/inference/go/openai/v1",
+  google: "https://generativelanguage.googleapis.com/v1beta/openai",
+};
+
+/**
+ * `google:gemini-3.5-flash-lite` — a fallback that lives on another provider.
+ *
+ * A bare name keeps the configured provider, so the old configs read exactly as
+ * before. The colon form exists because the chain the owner asked for crosses
+ * providers on purpose: two Go models, then two Google ones, and the Google half is
+ * what survives when the whole gateway is down.
+ */
+export function parseModelRef(ref: string, defaultProvider: string): { provider: string; model: string } {
+  const idx = ref.indexOf(":");
+  if (idx > 0 && idx < ref.length - 1 && !ref.slice(0, idx).includes("/")) {
+    return { provider: ref.slice(0, idx), model: ref.slice(idx + 1) };
+  }
+  return { provider: defaultProvider, model: ref };
+}
+
 
 const BALANCE_CHECK_INTERVAL = 10 * 60 * 1000; // 10 minutes
 const FALLBACK_RETRY_DELAY = 1000; // 1 second between fallback attempts (fixed, not exponential)
@@ -49,12 +84,20 @@ function withStreamingTimeout<T>(
   });
 }
 
+export interface ProviderAccount {
+  api_key?: string;
+  base_url?: string;
+  headers?: Record<string, string>;
+}
+
 export interface LLMRouterConfig {
   provider: string;
   api_key: string;
   fast_model: string;
   strong_model: string;
   fallback_models?: string[];
+  /** Keys/addresses for providers other than the default one. */
+  providers?: Record<string, ProviderAccount>;
 }
 
 export class LLMRouter {
@@ -82,8 +125,8 @@ export class LLMRouter {
       : DEFAULT_FALLBACKS;
 
     // Eagerly init delegates so they are always defined
-    this.fastDelegate = this.createClient(config.fast_model);
-    this.strongDelegate = this.createClient(config.strong_model);
+    this.fastDelegate = this.createClient(config.provider, config.fast_model);
+    this.strongDelegate = this.createClient(config.provider, config.strong_model);
   }
 
   get mode(): "normal" | "degraded" {
@@ -108,13 +151,31 @@ export class LLMRouter {
     this.stopBalanceCheck();
   }
 
-  private createClient(model: string): LLMClient {
-    switch (this.config.provider) {
-      case "openrouter":
-        return createOpenRouterClient({ apiKey: this.config.api_key, model });
-      default:
-        throw new Error(`Unknown LLM provider: ${this.config.provider}`);
+  private createClient(provider: string, model: string): LLMClient {
+    const account = this.config.providers?.[provider];
+    const apiKey = account?.api_key ?? (provider === this.config.provider ? this.config.api_key : undefined);
+    if (!apiKey) {
+      throw new Error(`No API key for LLM provider "${provider}" — add providers.${provider}.api_key`);
     }
+
+    if (provider === "openrouter") {
+      return createOpenRouterClient({ apiKey, model });
+    }
+
+    const baseURL = account?.base_url ?? PROVIDER_BASE_URLS[provider];
+    if (!baseURL) {
+      throw new Error(`Unknown LLM provider: ${provider} (no base_url configured)`);
+    }
+
+    // OpenCode's gateway routes a conversation by session id and refuses requests
+    // without one; a stable id per process is enough for a bot that talks in a chain
+    // of turns, and it is what lets the gateway reuse its prompt cache.
+    const headers: Record<string, string> = { ...(account?.headers ?? {}) };
+    if (provider === "opencode" && !headers["x-opencode-session"]) {
+      headers["x-opencode-session"] = `ses_betsy_${Math.random().toString(36).slice(2, 12)}`;
+    }
+
+    return createCompatClient({ apiKey, model, baseURL, headers });
   }
 
   private isRetryable(err: unknown): boolean {
@@ -193,11 +254,11 @@ export class LLMRouter {
     console.log(`⚠️ LLM: переключение на fallback модель: ${model}`);
     this._mode = "degraded";
     this.switchDelegates(model);
-    this.pendingNotification =
-      "⚠️ Баланс OpenRouter исчерпан, работаю на бесплатной модели. Когда баланс будет пополнен, автоматически вернусь на основную модель.";
-    // Only start balance check for billing errors (empty balance).
-    // Rate limit errors are transient — no need to poll for balance recovery.
-    if (isBillingError(err)) {
+    this.pendingNotification = "⚠️ Основная модель не отвечает — временно работаю на запасной.";
+    // The balance poll is OpenRouter's: it asks that API whether the account was topped
+    // up. On any other provider there is no such endpoint, and polling one that does not
+    // exist would keep the router degraded forever for no reason.
+    if (isBillingError(err) && this.config.provider === "openrouter") {
       this.startBalanceCheck();
     }
     return true;
@@ -217,18 +278,19 @@ export class LLMRouter {
     return true;
   }
 
-  private switchDelegates(model: string): void {
-    const client = this.createClient(model);
+  private switchDelegates(ref: string): void {
+    const { provider, model } = parseModelRef(ref, this.config.provider);
+    const client = this.createClient(provider, model);
     this.fastDelegate = client;
     this.strongDelegate = client;
   }
 
   private restoreMainModels(): void {
-    console.log("✅ LLM: баланс восстановлен, возвращаюсь на основные модели");
+    console.log("✅ LLM: основная модель снова отвечает, возвращаюсь на неё");
     this._mode = "normal";
-    this.fastDelegate = this.createClient(this.config.fast_model);
-    this.strongDelegate = this.createClient(this.config.strong_model);
-    this.pendingNotification = "✅ Баланс восстановлен, снова работаю на основной модели.";
+    this.fastDelegate = this.createClient(this.config.provider, this.config.fast_model);
+    this.strongDelegate = this.createClient(this.config.provider, this.config.strong_model);
+    this.pendingNotification = "✅ Снова работаю на основной модели.";
     this.stopBalanceCheck();
   }
 
