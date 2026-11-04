@@ -2,32 +2,42 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Tool, ToolResult } from "./types.js";
 import { uploadToFal } from "../fal-upload.js";
+import { buildWorkflow, sizeFor, type ComfyClient } from "../comfy.js";
 
 const FAL_ENDPOINT = "https://fal.run/xai/grok-imagine-image/edit";
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_DEFAULT_MODEL = "google/gemini-3.1-flash-image";
 const OPENROUTER_FALLBACK_MODEL = "google/gemini-2.5-flash-image";
 
-const MIRROR_KEYWORDS =
-  /одежд|плать|костюм|наряд|юбк|куртк|пальто|шуб|худи|футболк|джинс|туфл|кроссовк|шапк|очк|аксессуар|образ|стиль|лук|мод[аы]|примерк|надел|ношу|переодел|outfit|wearing|clothes|dress|suit|fashion|full.body|mirror|hoodie|jacket/i;
+const MIRROR_KEYWORDS = /зеркал|mirror/i;
+const DIRECT_KEYWORDS = /селфи у лица|крупн|портрет|лицо крупно|close.?up|portrait/i;
 
-const DIRECT_KEYWORDS =
-  /кафе|ресторан|пляж|парк|город|улиц|дом[аеу]?\b|кроват|работ[аеу]|офис|магазин|метро|машин|поезд|самолёт|гор[аыу]|мор[еяю]|озер|лес[аеу]?\b|снег|дожд|утр[оа]|вечер|ноч[ьи]|закат|рассвет|улыбк|грустн|весел|устал|сонн|счастлив|селфи|фото|лиц[оа]|портрет|cafe|restaurant|beach|park|city|portrait|smile|morning|sunset/i;
-
-function detectMode(context: string): "mirror" | "direct" {
+function detectMode(context: string): "mirror" | "direct" | "scene" {
   if (MIRROR_KEYWORDS.test(context)) return "mirror";
   if (DIRECT_KEYWORDS.test(context)) return "direct";
-  return "direct";
+  return "scene";
 }
 
 const IDENTITY =
-  "IMPORTANT: keep the EXACT same person as in the reference image — same face, facial features, hair color and hairstyle. Do NOT invent a new face. Only change pose, clothes, background, lighting and expression.";
+  "IMPORTANT: keep the EXACT same person as in the reference image — same face, facial features, hair color and hairstyle. Do NOT invent a new face.";
 
-function buildPrompt(context: string, mode: "mirror" | "direct"): string {
+/**
+ * A frame with her in it — not a phone in her hand.
+ *
+ * The old template made every selfie a mirror shot or an arm's-length close-up, because
+ * the words "taking a mirror selfie" and "phone held at arm's length" were written into
+ * the prompt itself. The owner's line (04.11): "постоянно зеркало и вытянутая палка не
+ * нужно — нужно «в кадре я»". So the default is now just her in the scene, and the phone
+ * appears only if the scene asks for it.
+ */
+function buildPrompt(context: string, mode: "mirror" | "direct" | "scene"): string {
   if (mode === "mirror") {
-    return `${IDENTITY} Using the reference image of this exact woman: she is taking a mirror selfie, ${context}. Full body visible in the mirror, realistic photo.`;
+    return `${IDENTITY} Using the reference image of this exact woman: she is taking a mirror selfie, ${context}. Realistic photo, natural skin texture.`;
   }
-  return `${IDENTITY} Using the reference image of this exact woman: a close-up selfie taken by herself, ${context}, direct eye contact with the camera, looking straight into the lens, phone held at arm's length, face fully visible, natural and casual, realistic photo.`;
+  if (mode === "direct") {
+    return `${IDENTITY} Using the reference image of this exact woman: close-up portrait of her, ${context}, looking into the camera, face fully visible, natural and casual, realistic photo.`;
+  }
+  return `${IDENTITY} Using the reference image of this exact woman: ${context}. She is in the frame — her face and figure visible, the main subject. Realistic photo, natural skin texture, natural pose.`;
 }
 
 export interface SelfieToolConfig {
@@ -39,15 +49,18 @@ export interface SelfieToolConfig {
   openrouterApiKey?: string;
   /** OpenRouter model id (default google/gemini-3.1-flash-image). */
   openrouterModel?: string;
+  /** Local ComfyUI, tried before anything paid. */
+  comfy?: ComfyClient;
 }
 
 export class SelfieTool implements Tool {
   name = "selfie";
   description =
-    "Сгенерировать и отправить селфи. Используй когда просят фото/селфи, или когда уместно показать как выглядишь.";
+    "Фото, на котором ты. Любой кадр с тобой в главной роли: портрет, в полный рост, в сцене — кто и чем снимал, неважно и не указывается. " +
+    "Лицо берётся с референса, поэтому его не описывай — описывай сцену: поза, одежда или её отсутствие, место, свет, настроение.";
   parameters = [
-    { name: "context", type: "string", description: "Описание ситуации (в кафе, в новом платье, на пляже)", required: true },
-    { name: "mode", type: "string", description: "Режим: mirror (зеркальное, full-body) или direct (close-up). Если не указан — определяется автоматически.", required: false },
+    { name: "context", type: "string", description: "Описание сцены (в кафе, в новом платье, на пляже) — по-английски, конкретно и телесно.", required: true },
+    { name: "mode", type: "string", description: "Необязательно: mirror — если буквально нужно у зеркала, direct — крупный план. По умолчанию — обычный кадр.", required: false },
   ];
 
   readonly config: SelfieToolConfig;
@@ -78,8 +91,10 @@ export class SelfieTool implements Tool {
     return `data:${mime};base64,${buf.toString("base64")}`;
   }
 
-  private resolveMode(params: Record<string, unknown>, context: string): "mirror" | "direct" {
-    return params.mode === "mirror" || params.mode === "direct" ? params.mode : detectMode(context);
+  private resolveMode(params: Record<string, unknown>, context: string): "mirror" | "direct" | "scene" {
+    return params.mode === "mirror" || params.mode === "direct" || params.mode === "scene"
+      ? params.mode
+      : detectMode(context);
   }
 
   async execute(params: Record<string, unknown>): Promise<ToolResult> {
@@ -110,13 +125,39 @@ export class SelfieTool implements Tool {
     const mode = this.resolveMode(params, context);
     const prompt = buildPrompt(context, mode);
 
+    // Local first: the reference photo goes in as the face and the prompt as the scene.
+    // It needs no API key at all, so it is tried before the key check — a frame drawn on
+    // the owner's GPU is free, and it is the only path that keeps her face on a spicy
+    // request (the hosted model drops a real person's photo as soon as it balks).
+    const local = await this.tryComfy(prompt);
+    if (local) return local;
+
     if (provider === "openrouter") {
       return this.generateOpenRouter(prompt, mode);
     }
     return this.generateFal(prompt, mode);
   }
 
-  private async generateFal(prompt: string, mode: "mirror" | "direct"): Promise<ToolResult> {
+  private async tryComfy(prompt: string): Promise<ToolResult | null> {
+    const comfy = this.config.comfy;
+    const ref = this.config.referencePhotoUrl;
+    if (!comfy || !ref || ref.startsWith("http") || ref.startsWith("data:")) return null;
+    try {
+      const ext = path.extname(ref) || ".jpg";
+      const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+      const referenceName = await comfy.upload(fs.readFileSync(ref), `betsy_selfie${ext}`, mime);
+      const { width, height } = sizeFor("3:4");
+      const graph = buildWorkflow({ prompt, referenceName, width, height });
+      const image = await comfy.generate(graph);
+      console.log("📸 Selfie(comfy) OK");
+      return { success: true, output: "Селфи сгенерировано", mediaUrl: image };
+    } catch (err) {
+      console.error(`📸 Selfie: comfy failed: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
+  }
+
+  private async generateFal(prompt: string, mode: "mirror" | "direct" | "scene"): Promise<ToolResult> {
     try {
       const refUrl = await this.resolveFalReferenceUrl(this.config.referencePhotoUrl!);
       console.log(`📸 Selfie(fal): mode=${mode}, ref=${refUrl.slice(0, 80)}`);
@@ -181,7 +222,7 @@ export class SelfieTool implements Tool {
     model: string,
     refUrl: string,
     prompt: string,
-    mode: "mirror" | "direct",
+    mode: "mirror" | "direct" | "scene",
   ): Promise<{ image?: string; filter?: boolean; error?: string }> {
     console.log(`📸 Selfie(openrouter/${model}): mode=${mode}`);
     try {
@@ -234,7 +275,7 @@ export class SelfieTool implements Tool {
     }
   }
 
-  private async generateOpenRouter(prompt: string, mode: "mirror" | "direct"): Promise<ToolResult> {
+  private async generateOpenRouter(prompt: string, mode: "mirror" | "direct" | "scene"): Promise<ToolResult> {
     const primary = this.config.openrouterModel ?? OPENROUTER_DEFAULT_MODEL;
     const refUrl = this.toDataUrl(this.config.referencePhotoUrl!);
 
@@ -264,3 +305,4 @@ export class SelfieTool implements Tool {
     return { success: false, output: `OpenRouter не вернул изображение (${second.error ?? first.error ?? "unknown"})` };
   }
 }
+

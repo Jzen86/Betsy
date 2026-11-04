@@ -1,0 +1,317 @@
+import { randomUUID } from "node:crypto";
+
+/**
+ * Local image generation through ComfyUI.
+ *
+ * The graph is ours and only ours: its own node ids, its own output folder
+ * (`eva/`), its own uploaded reference names (`eva_ref_*`). The owner's
+ * workflows live in the same ComfyUI and use custom nodes and prefixes of their
+ * own; nothing here reads or writes them.
+ */
+
+export const COMFY_UNET = "qwen_image_2.1_turbo_int8_convrot.safetensors";
+export const COMFY_CLIP = "qwen3vl_8b_int8_convrot.safetensors";
+export const COMFY_VAE = "qwen_image_2.1_vae_bf16.safetensors";
+
+/**
+ * The noise schedule Qwen-Image 2.1 Turbo is distilled on — and the reason the
+ * sampler is a chain instead of a KSampler.
+ *
+ * The old graph asked KSampler for 8 steps and named a scheduler — `simple` for
+ * a selfie, `linear_quadratic` for a plain picture. That is a *guess at* the
+ * schedule, not the schedule. Turbo is distilled onto these exact sigmas: it is
+ * cheap and clean at its own step count and its own noise levels, and a
+ * scheduler that merely resembles them is a stand-in. The desktop graph swapped
+ * the guess out; this is the same list, so the bot and the desktop render alike.
+ *
+ * One schedule now, where there used to be two. That split existed because the
+ * approximation had to be picked per case: a reference carries the structure and
+ * tolerated `simple`'s low-frequency tail, a text-only frame did not. The native
+ * schedule is the trained one for both, so the branch is gone.
+ *
+ * Kept beside the model name, not inside the graph, so the two cannot drift.
+ */
+export const TURBO_SIGMAS = "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0";
+
+export interface ComfyGraphOptions {
+  prompt: string;
+  seed?: number;
+  /** Uploaded reference image name, as returned by /upload/image. */
+  referenceName?: string;
+  /**
+   * A second uploaded reference, for a frame with two people in it.
+   *
+   * `TextEncodeQwenImageEditPlus` takes up to three images, and its whole point
+   * is multi-image editing: image 1 is the bot, image 2 is the owner, and the
+   * prompt says which face comes from which. One reference (the selfie) leaves
+   * this unset and the graph is exactly what it was.
+   */
+  referenceName2?: string;
+  filenamePrefix?: string;
+  /** Output size. Defaults to the 1:1 frame, so an unset size stays in scheme. */
+  width?: number;
+  height?: number;
+  /** How the reference is scaled for the encoder: it is resized to about this square. */
+  resolution?: number;
+}
+
+/**
+ * Output formats: one long side of 896, and three frames.
+ *
+ * 896 is a multiple of 32 — Qwen-Image 2.1's VAE is /16 and its patch is 2, so a
+ * side that is not a multiple of 32 gets padded — and it is enough for a phone
+ * screen without paying for pixels nobody looks at. It is also where the budget
+ * lands: 896×896 is 0.80 megapixels and 672×896 is 0.60, against 1.05 for the
+ * 1024×1024 this replaced, and the same rule costs roughly a quarter less time on
+ * every frame (4.6 s against 5.6 s, 8 steps, warm).
+ *
+ * Three frames, not six. A square for two people in the shot, a portrait for a
+ * whole figure, a landscape when the scene needs width — and Eva picks between
+ * them from the scene, which is why each carries a word she can read. 2:3, 4:5
+ * and 9:16 were dropped: at a fixed 896 side they land at 0.55 and below, and
+ * under about half a megapixel Qwen starts to smear. The square stays the
+ * heaviest of the three deliberately — it is the pair frame, where two faces
+ * share the pixels, and that is the one place the budget buys something.
+ *
+ * `label` is the word the tool descriptions use for the format, and those
+ * descriptions are built from this table (`formatList`) rather than written
+ * beside it. The second copy is what drifted, twice: first the tools promised
+ * three formats while the table had six, then they kept promising 5:4 after 5:4
+ * was gone and said nothing about 9:16 — a request for 5:4 fell silently back to
+ * the default, and nobody asked for 9:16 because nobody knew it existed. Eva
+ * found the second one by reading the file. A list that cannot be written twice
+ * cannot go stale.
+ */
+export const FORMATS = {
+  "1:1": { width: 896, height: 896, label: "квадрат" },
+  "3:4": { width: 672, height: 896, label: "вертикаль" },
+  "4:3": { width: 896, height: 672, label: "горизонталь" },
+} as const;
+
+export type AspectFormat = keyof typeof FORMATS;
+
+/** Size for a named format; anything unknown falls back to 1:1. */
+export function sizeFor(format: string | undefined): { width: number; height: number } {
+  const frame = FORMATS[(format ?? "") as AspectFormat] ?? FORMATS["1:1"];
+  // Only the two numbers: this gets spread into the graph, and a stray field
+  // would ride along into the workflow.
+  return { width: frame.width, height: frame.height };
+}
+
+/**
+ * The formats as one phrase for the tool descriptions: "1:1 (квадрат), 2:3 (высокий), …".
+ *
+ * Built from the table, never typed out beside it — see the note on `FORMATS`
+ * for the two times a hand-written copy went stale.
+ */
+export function formatList(): string {
+  return (Object.keys(FORMATS) as AspectFormat[])
+    .map((key) => `${key} (${FORMATS[key].label})`)
+    .join(", ");
+}
+
+/**
+ * The frame as an images API wants it.
+ *
+ * The local graph takes any size we ask for, but the cloud endpoints accept a
+ * short list — 1024x1024, 1024x1536, 1536x1024 — and anything else comes back
+ * rejected or silently coerced. So the frame travels as its shape rather than
+ * its numbers: portrait, landscape, square.
+ */
+export function cloudSizeFor(size: { width: number; height: number }): string {
+  if (size.height > size.width) return "1024x1536";
+  if (size.width > size.height) return "1536x1024";
+  return "1024x1024";
+}
+
+export type ComfyGraph = Record<string, { class_type: string; inputs: Record<string, unknown> }>;
+
+/** The picture graph: text-to-image alone, or reference-editing when a photo is given. */
+export function buildWorkflow(opts: ComfyGraphOptions): ComfyGraph {
+  const hasRef = Boolean(opts.referenceName);
+  const hasRef2 = Boolean(opts.referenceName2);
+  const anyRef = hasRef || hasRef2;
+  const graph: ComfyGraph = {
+    "1": { class_type: "UNETLoader", inputs: { unet_name: COMFY_UNET, weight_dtype: "default" } },
+    "2": { class_type: "CLIPLoader", inputs: { clip_name: COMFY_CLIP, type: "qwen_image", device: "default" } },
+    "3": { class_type: "VAELoader", inputs: { vae_name: COMFY_VAE } },
+    "4": { class_type: "QwenImage21Cache", inputs: { model: ["1", 0], device: "auto", dtype: "default" } },
+    // The encoder is the whole ballgame for the face.
+    //
+    // With a reference the graph uses TextEncodeQwenImageEditPlus: it feeds the
+    // reference's vision tokens *and* its VAE latents into the model, so the text
+    // prompt edits that woman rather than describing a new one. The plain
+    // TextEncodeQwenImage21 drops the vision tokens the moment a reference latent
+    // is present, and then a long figure description simply overrides the face.
+    // Measured on the live reference, one seed per row: EditPlus kept her face on
+    // 4 of 4 seeds; the 21-encoder drew a different woman on 2 of them, both times
+    // with the long body text in the prompt and never without it.
+    //
+    // Without a reference (image_gen) there is nothing to edit, so the 21-encoder
+    // is the plain text-to-image path, negative prompt and all.
+    "5": anyRef
+      ? {
+          class_type: "TextEncodeQwenImageEditPlus",
+          inputs: {
+            clip: ["2", 0],
+            prompt: opts.prompt,
+            vae: ["3", 0],
+            ...(hasRef ? { image1: ["6", 0] } : {}),
+            ...(hasRef2 ? { image2: ["11", 0] } : {}),
+          },
+        }
+      : {
+          class_type: "TextEncodeQwenImage21",
+          inputs: {
+            clip: ["2", 0],
+            prompt: opts.prompt,
+            negative_prompt: "",
+            resolution: opts.resolution ?? 1024,
+            vae: ["3", 0],
+          },
+        },
+    // Sampling is the stock five-node chain (noise, sampler, sigmas, guider,
+    // SamplerCustomAdvanced) and not a KSampler, because only this shape can take
+    // a schedule as a value — see TURBO_SIGMAS. It is the same shape the desktop
+    // graph runs, so both render the same; and it stays on core nodes, so the bot
+    // keeps its own graph and neither reads nor needs the owner's custom ones.
+    "7": {
+      class_type: "SamplerCustomAdvanced",
+      inputs: {
+        noise: ["12", 0],
+        guider: ["15", 0],
+        sampler: ["13", 0],
+        sigmas: ["14", 0],
+        latent_image: ["9", 0],
+      },
+    },
+    "8": { class_type: "VAEDecode", inputs: { samples: ["7", 0], vae: ["3", 0] } },
+    // The empty latent sets the output size — the node's own latent output is
+    // sized to the reference (square), which would pin every frame to 1:1 and
+    // ignore 3:4 / 4:3. Measured: a 768×1024 empty latent renders 3:4 with the
+    // face intact, so the size is what decides the frame, not the reference.
+    "9": {
+      class_type: "EmptyLatentImage",
+      inputs: {
+        width: opts.width ?? FORMATS["1:1"].width,
+        height: opts.height ?? FORMATS["1:1"].height,
+        batch_size: 1,
+      },
+    },
+    "10": {
+      class_type: "SaveImage",
+      inputs: { images: ["8", 0], filename_prefix: opts.filenamePrefix ?? "eva/img" },
+    },
+    // The rest of the sampler chain. Ids 12–15 sit after 10 so the nodes that
+    // were already here keep the ids their comments and tests name.
+    "12": { class_type: "RandomNoise", inputs: { noise_seed: opts.seed ?? Math.floor(Math.random() * 2 ** 31) } },
+    "13": { class_type: "KSamplerSelect", inputs: { sampler_name: "euler" } },
+    "14": { class_type: "ManualSigmas", inputs: { sigmas: TURBO_SIGMAS } },
+    "15": {
+      class_type: "CFGGuider",
+      inputs: {
+        model: ["4", 0],
+        positive: ["5", 0],
+        // EditPlus has a single output; the 21-encoder has positive and negative.
+        // cfg is 1, so the negative has no effect either way.
+        negative: anyRef ? ["5", 0] : ["5", 1],
+        cfg: 1,
+      },
+    },
+  };
+
+  if (opts.referenceName) {
+    // Node 6 is the first reference; node 5 (built above) points its image1 here.
+    graph["6"] = { class_type: "LoadImage", inputs: { image: opts.referenceName } };
+  }
+  if (opts.referenceName2) {
+    // Node 11 is the second reference — the owner, in a frame with both of them.
+    // The key stays flat (a nested `images: {image_1: …}` was silently ignored
+    // once and drew a stranger); image2 is the slot the prompt calls his.
+    graph["11"] = { class_type: "LoadImage", inputs: { image: opts.referenceName2 } };
+  }
+
+  return graph;
+}
+
+export interface ComfyClientOptions {
+  baseUrl: string;
+  /** Whole-job budget. A cold model load on 12 GB VRAM is slow, not stuck. */
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
+export class ComfyClient {
+  private baseUrl: string;
+  private timeoutMs: number;
+  private pollMs: number;
+  private clientId = randomUUID();
+
+  constructor(opts: ComfyClientOptions) {
+    this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
+    this.timeoutMs = opts.timeoutMs ?? 180_000;
+    this.pollMs = opts.pollMs ?? 1_500;
+  }
+
+  /** Uploads a reference picture to ComfyUI's input folder and returns its name. */
+  async upload(bytes: Buffer, filename: string, mime: string): Promise<string> {
+    const form = new FormData();
+    form.append("image", new Blob([new Uint8Array(bytes)], { type: mime }), filename);
+    form.append("overwrite", "true");
+    const res = await fetch(`${this.baseUrl}/upload/image`, { method: "POST", body: form });
+    if (!res.ok) throw new Error(`comfy upload ${res.status}`);
+    const json = (await res.json()) as { name?: string };
+    if (!json.name) throw new Error("comfy upload: no name in response");
+    return json.name;
+  }
+
+  /** Runs a graph and returns the first picture as a data URL. */
+  async generate(graph: ComfyGraph): Promise<string> {
+    const queued = await fetch(`${this.baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: graph, client_id: this.clientId }),
+    });
+    if (!queued.ok) throw new Error(`comfy prompt ${queued.status}`);
+    const { prompt_id } = (await queued.json()) as { prompt_id: string };
+
+    const deadline = Date.now() + this.timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      const hist = await fetch(`${this.baseUrl}/history/${prompt_id}`);
+      if (!hist.ok) continue;
+      const entry = ((await hist.json()) as Record<string, ComfyHistory>)[prompt_id];
+      if (!entry) continue;
+      if (entry.status?.status_str === "error") throw new Error("comfy job failed");
+      const image = firstImage(entry.outputs);
+      if (!image) throw new Error("comfy: no image in outputs");
+      const view = await fetch(
+        `${this.baseUrl}/view?${new URLSearchParams({ filename: image.filename, subfolder: image.subfolder, type: image.type })}`,
+      );
+      if (!view.ok) throw new Error(`comfy view ${view.status}`);
+      const b64 = Buffer.from(await view.arrayBuffer()).toString("base64");
+      return `data:image/png;base64,${b64}`;
+    }
+    throw new Error("comfy timeout");
+  }
+}
+
+interface ComfyImage {
+  filename: string;
+  subfolder: string;
+  type: string;
+}
+
+interface ComfyHistory {
+  status?: { status_str?: string };
+  outputs?: Record<string, { images?: ComfyImage[] }>;
+}
+
+function firstImage(outputs: ComfyHistory["outputs"]): ComfyImage | undefined {
+  if (!outputs) return undefined;
+  for (const node of Object.values(outputs)) {
+    const img = node.images?.[0];
+    if (img) return img;
+  }
+  return undefined;
+}

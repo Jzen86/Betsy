@@ -26,6 +26,7 @@ import { npmInstallTool } from "./core/tools/npm-install.js";
 import { SelfieTool } from "./core/tools/selfie.js";
 import { VoiceTool } from "./core/tools/voice.js";
 import { ImageGenTool } from "./core/tools/image-gen.js";
+import { ComfyClient } from "./core/comfy.js";
 import { SkillSearchTool } from "./core/tools/skill-search.js";
 import { SkillInstallTool } from "./core/tools/skill-install.js";
 import { SendFileTool } from "./core/tools/send-file.js";
@@ -144,12 +145,20 @@ async function main() {
   // Selfie tool — uses fal.ai key from selfies config, falls back to video config
   const selfiesConfig = config.selfies as Record<string, string> | undefined;
   const videoConfig = config.video as Record<string, string> | undefined;
+  // The chat key is not the image key any more: chat runs on OpenCode Go, and handing
+  // that token to OpenRouter would send every selfie request to a host that never heard
+  // of it. Images and voice keep their own accounts.
+  const openrouterKey = (config as any).providers?.openrouter?.api_key as string | undefined;
+  const comfyUrl = (config as any).comfy?.url as string | undefined;
+  const comfyClient = comfyUrl ? new ComfyClient({ baseUrl: comfyUrl }) : undefined;
+  if (comfyClient) console.log(`🖼 ComfyUI: ${comfyUrl}`);
   const selfieTool = new SelfieTool({
     falApiKey: selfiesConfig?.fal_api_key ?? videoConfig?.fal_api_key ?? "",
     referencePhotoUrl: selfiesConfig?.reference_photo_url,
     provider: (selfiesConfig?.provider as "fal" | "openrouter" | undefined) ?? "fal",
-    openrouterApiKey: selfiesConfig?.openrouter_api_key ?? getLLMApiKey(config) ?? "",
+    openrouterApiKey: selfiesConfig?.openrouter_api_key ?? openrouterKey ?? "",
     openrouterModel: selfiesConfig?.openrouter_model,
+    comfy: comfyClient,
   });
   tools.register(selfieTool);
   // Voice tool — lets Betsy send voice messages on her own initiative
@@ -160,7 +169,7 @@ async function main() {
   // Image generation tool — uses OpenRouter API key
   const llmApiKey = getLLMApiKey(config);
   if (llmApiKey) {
-    tools.register(new ImageGenTool({ apiKey: llmApiKey }));
+    tools.register(new ImageGenTool({ apiKey: openrouterKey ?? llmApiKey, comfy: comfyClient }));
   }
   // SkillsMP tools — search and install agent skills
   const skillsmpKey = (config as any).skillsmp?.api_key as string | undefined;

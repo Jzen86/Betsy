@@ -36,6 +36,26 @@ function toOggOpus(buffer: Buffer, mimeType: string): Promise<Buffer | null> {
   });
 }
 
+/** Convert arbitrary audio bytes to MP3 (a plain audio file, not a voice note). */
+function toMp3(buffer: Buffer): Promise<Buffer | null> {
+  return new Promise((resolve) => {
+    const args = ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-c:a", "libmp3lame", "-b:a", "96k", "-f", "mp3", "pipe:1"];
+    let ff;
+    try {
+      ff = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      return resolve(null);
+    }
+    const chunks: Buffer[] = [];
+    ff.stdout.on("data", (c: Buffer) => chunks.push(c));
+    ff.on("error", () => resolve(null));
+    ff.on("close", (code) => resolve(code === 0 ? Buffer.concat(chunks) : null));
+    ff.stdin.on("error", () => { /* ignore EPIPE */ });
+    ff.stdin.write(buffer);
+    ff.stdin.end();
+  });
+}
+
 /** Synthesize speech as raw provider bytes (kept for backwards compatibility). */
 export async function synthesizeSpeech(
   text: string,
@@ -208,7 +228,10 @@ export async function synthesizeVoiceOgg(
 
 /** Send a voice response through a grammY context. Always delivers real OGG/Opus. */
 export async function sendVoiceResponse(
-  ctx: { replyWithVoice: (file: unknown) => Promise<unknown> },
+  ctx: {
+    replyWithVoice: (file: unknown) => Promise<unknown>;
+    replyWithAudio?: (file: unknown) => Promise<unknown>;
+  },
   text: string,
   voiceConfig: Record<string, unknown>,
   falApiKey?: string,
@@ -222,8 +245,28 @@ export async function sendVoiceResponse(
     const { InputFile } = await import("grammy");
     await ctx.replyWithVoice(new InputFile(tmpFile));
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // Telegram refuses voice notes for an account whose privacy setting bars them —
+    // `VOICE_MESSAGES_FORBIDDEN`, and it hits *every* bot at once, so it is not a sign
+    // that anything is broken here. What must not happen is the line being lost: the
+    // same audio is re-containerised as an MP3 and sent as a file, which is still
+    // something to listen to. Measured on the live install (04.11): the OGG failed for
+    // both bots, the MP3 went through in one call.
+    console.error("voice: replyWithVoice failed:", err instanceof Error ? err.message : err);
+    const mp3 = await toMp3(ogg);
+    if (!mp3 || !ctx.replyWithAudio) return false;
+    const mp3File = path.join(os.tmpdir(), `betsy-tts-${Date.now()}.mp3`);
+    try {
+      fs.writeFileSync(mp3File, mp3);
+      const { InputFile } = await import("grammy");
+      await ctx.replyWithAudio(new InputFile(mp3File));
+      return true;
+    } catch (e2) {
+      console.error("voice: replyWithAudio failed too:", e2 instanceof Error ? e2.message : e2);
+      return false;
+    } finally {
+      try { fs.unlinkSync(mp3File); } catch { /* ignore */ }
+    }
   } finally {
     try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
   }
