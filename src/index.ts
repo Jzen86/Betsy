@@ -102,17 +102,23 @@ async function main() {
   const schedulerStore = new SchedulerStore(schedulerDb);
   schedulerStore.init();
   const scheduler = new SchedulerService(schedulerStore);
-  tools.register(new ShellTool());
+  // Which hands she has. The flags in `security.tools` were decorative until now: the
+  // tools were registered unconditionally and the config was never read. Default is off
+  // for the three that can change the machine (shell, ssh, npm) — a companion that talks,
+  // draws and remembers does not need root — and the owner can turn any of them back on
+  // in the config.
+  const toolFlags = (config.security?.tools ?? {}) as Record<string, boolean | undefined>;
+  if (toolFlags.shell === true) tools.register(new ShellTool());
   tools.register(new SendFileTool());
   tools.register(new FilesTool());
   const passwordHash = config.security?.password_hash ?? "default-key-change-me";
   tools.register(new HttpTool({ encryptionKey: passwordHash }));
-  tools.register(new BrowserTool());
+  if (toolFlags.browser !== false) tools.register(new BrowserTool());
   tools.register(memoryTool);
   tools.register(selfConfigTool);
   tools.register(scheduler.tool);
-  tools.register(sshTool);
-  tools.register(npmInstallTool);
+  if (toolFlags.ssh === true) tools.register(sshTool);
+  if (toolFlags.npm_install === true) tools.register(npmInstallTool);
   // channels map is populated later — closure captures the reference
   const channels = new Map<string, Channel>();
   tools.register(new ConnectServiceTool({
