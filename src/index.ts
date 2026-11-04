@@ -342,8 +342,17 @@ async function main() {
           timestamp: Date.now(),
           metadata: { scheduledTask: true },
         });
-        await channel.send(task.chatId, result);
-        console.log(`✅ Scheduler: delivered "${task.name}" to ${task.channel}:${task.chatId}`);
+        // A scheduled turn may decide there is nothing to say. The marker is exactly
+        // `[тишина]` and nothing else — an empty reply is not silence, it is a failure,
+        // and swallowing it would make "нечего сообщить" and "модель промолчала" look
+        // identical in the log.
+        const replyText = String((result as { text?: string })?.text ?? "").trim();
+        if (replyText === "[тишина]") {
+          console.log(`[тишина] Scheduler: "${task.name}" — сообщать нечего`);
+        } else {
+          await channel.send(task.chatId, result);
+          console.log(`✅ Scheduler: delivered "${task.name}" to ${task.channel}:${task.chatId}`);
+        }
       } catch (err) {
         console.error(`❌ Scheduler: failed to deliver "${task.name}":`, err);
       }
