@@ -1,3 +1,5 @@
+> ⚠️ **Бетси снова живая с 04.11.2026 — и это отдельный бот.** Свой токен (`@evz_assistant_ai`), свой конфиг (`~/.betsy/config.yaml`), своя база (`~/.betsy/betsy.db`), сервис `betsy.service` — `active`. Ева не тронута и живёт на `@evz_betsybot`. Чат — OpenCode Go (`deepseek-v4.1-flash` → `glm-5.3-flash` → `google:gemini-3.5-flash-lite` → `2.1`), голос — Gemini TTS, картинки — локальный ComfyUI с откатом в облако. Код — ветка `model-stack`, на сервере `/opt/betsy` — git-клон.
+
 # Betsy — зона проекта
 
 Зона проекта — Telegram-AI-компаньон **«Betsy»**: живёт в **личке владельца** как персонаж с памятью, голосом и медиа. Крутится на сервере `rdp-fi` (Node.js, канал Telegram через grammy, LLM через OpenRouter, память SQLite).
