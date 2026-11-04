@@ -2,6 +2,30 @@ import type { Tool, ToolResult } from "./types.js";
 import { loadConfig, saveConfig, type BetsyConfig } from "../config.js";
 
 // ---------------------------------------------------------------------------
+// What she may read and change about herself
+// ---------------------------------------------------------------------------
+//
+// The tool was a door to the whole config: `list` flattened it — every API key, the bot
+// token, the owner's Telegram id — straight into a chat message, and `set` accepted any
+// key, including `security.tools.shell`, which would have re-armed the shell we had just
+// taken away. Measured on the live install (05.11): she is allowed to be a personality,
+// not an administrator, so the allowlist below is the whole surface. Anything else is
+// refused by prefix, not by a blacklist — a new secret added to the config tomorrow is
+// closed by default.
+const ALLOWED_PREFIXES = [
+  "agent.name",
+  "agent.gender",
+  "agent.personality",
+  "owner.name",
+  "owner.facts",
+];
+
+function isAllowedKey(key: string): boolean {
+  const k = key.trim();
+  return ALLOWED_PREFIXES.some((p) => k === p || k.startsWith(p + "."));
+}
+
+// ---------------------------------------------------------------------------
 // Helpers for nested key access (e.g. "agent.gender", "memory.max_knowledge")
 // ---------------------------------------------------------------------------
 
@@ -60,6 +84,9 @@ function handleGet(params: Record<string, unknown>): ToolResult {
   if (typeof key !== "string" || !key.trim()) {
     return { success: false, output: "Missing required parameter: key", error: "missing_param" };
   }
+  if (!isAllowedKey(key)) {
+    return { success: false, output: `Ключ "${key}" закрыт: читать можно только имя, пол, характер и данные о нём.`, error: "forbidden_key" };
+  }
   const config = loadConfig();
   if (!config) {
     return { success: false, output: "Config file not found.", error: "no_config" };
@@ -75,6 +102,9 @@ function handleSet(params: Record<string, unknown>): ToolResult {
   const key = params.key;
   if (typeof key !== "string" || !key.trim()) {
     return { success: false, output: "Missing required parameter: key", error: "missing_param" };
+  }
+  if (!isAllowedKey(key)) {
+    return { success: false, output: `Ключ "${key}" закрыт: менять можно только имя, пол, характер и данные о нём.`, error: "forbidden_key" };
   }
   const value = params.value;
   if (value === undefined || value === null) {
@@ -92,6 +122,9 @@ function handleAppend(params: Record<string, unknown>): ToolResult {
   const key = params.key;
   if (typeof key !== "string" || !key.trim()) {
     return { success: false, output: "Missing required parameter: key", error: "missing_param" };
+  }
+  if (!isAllowedKey(key)) {
+    return { success: false, output: `Ключ "${key}" закрыт: дописывать можно только в данные о нём.`, error: "forbidden_key" };
   }
   const value = params.value;
   if (value === undefined || value === null) {
@@ -113,7 +146,7 @@ function handleList(): ToolResult {
     return { success: true, output: "Config is empty (no config file found)." };
   }
   const flat = flattenObject(config as unknown as Record<string, unknown>);
-  const keys = Object.keys(flat);
+  const keys = Object.keys(flat).filter((k) => isAllowedKey(k));
   if (keys.length === 0) {
     return { success: true, output: "Config is empty." };
   }
@@ -124,7 +157,8 @@ function handleList(): ToolResult {
 export const selfConfigTool: Tool = {
   name: "self_config",
   description:
-    "Read or write Betsy's own configuration stored in ~/.betsy/config.yaml. " +
+    "Read or write her own personality settings (name, gender, tone, style, character text, sliders) and the owner's name/facts. " +
+    "Any other key — API keys, the bot token, tools, providers — is closed and answers with a refusal. " +
     "Uses dot-notation for nested keys. " +
     "Key examples: agent.name, agent.gender (female/male/neutral), " +
     "agent.personality.tone, agent.personality.style, agent.personality.custom_instructions, " +
