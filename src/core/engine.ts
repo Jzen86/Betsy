@@ -7,6 +7,7 @@ import { searchKnowledge } from "./memory/knowledge.js";
 import { saveMessage, loadHistory, extractText } from "./memory/conversations.js";
 import { compactHistory } from "./memory/compaction.js";
 import { LLMUnavailableError } from "./llm/router.js";
+import { parseDsmlToolCalls } from "./llm/dsml.js";
 import { TokenStore } from "../services/tokens.js";
 import { getService } from "../services/catalog.js";
 import { SkillsStore } from "../services/skills-store.js";
@@ -266,6 +267,20 @@ export class Engine {
           }));
         }
 
+        // Если внутри блока были вызовы — это не поломка, а родной язык модели:
+        // переводим его в настоящие tool_calls и продолжаем работу.
+        const recoveredCalls = response.toolCalls?.length
+          ? []
+          : parseDsmlToolCalls(response.text ?? "");
+        const effectiveCalls = response.toolCalls?.length ? response.toolCalls : recoveredCalls;
+        if (recoveredCalls.length) {
+          console.log(JSON.stringify({
+            tag: "engine:recovered_tool_calls",
+            turn: turn + 1,
+            tools: recoveredCalls.map((c) => c.name),
+          }));
+        }
+
         console.log(JSON.stringify({
           tag: "engine",
           turn: turn + 1,
@@ -276,13 +291,13 @@ export class Engine {
           historyChars: histSize,
           reasoning: safeText.slice(0, 200),
           stopReason: response.stopReason,
-          toolCalls: response.toolCalls?.map(t => t.name),
+          toolCalls: effectiveCalls.map((t) => t.name),
         }));
 
         // Без инструментов такой ответ — это поломка хода: работа не сделана.
         // Просим повторить правильно один раз; если и второй раз текстом —
         // отдаём остаток и говорим как есть.
-        if (!response.toolCalls?.length && textBrokenBySyntax) {
+        if (!effectiveCalls.length && textBrokenBySyntax) {
           if (badSyntaxTries < 1) {
             badSyntaxTries++;
             if (safeText) history.push({ role: "assistant", content: safeText });
@@ -315,7 +330,7 @@ export class Engine {
         }
 
         // If LLM didn't request tools, return the text response
-        if (response.stopReason !== "tool_use" || !response.toolCalls?.length) {
+        if (effectiveCalls.length === 0) {
           const text = safeText || "...";
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
@@ -349,12 +364,12 @@ export class Engine {
         history.push({
           role: "assistant",
           content: safeText,
-          toolCalls: response.toolCalls,
+          toolCalls: effectiveCalls,
         });
-        saveMessage(userId, msg.channelName, "assistant", safeText, undefined, response.toolCalls);
+        saveMessage(userId, msg.channelName, "assistant", safeText, undefined, effectiveCalls);
 
         // Execute each tool and add results to history
-        for (const tc of response.toolCalls) {
+        for (const tc of effectiveCalls) {
           onProgress?.({ type: "tool_start", tool: tc.name, turn: turn + 1 });
 
           const toolStart = Date.now();
@@ -397,7 +412,7 @@ export class Engine {
         }
 
         // Increment tool counts for this cycle
-        for (const tc of response.toolCalls) {
+        for (const tc of effectiveCalls) {
           toolCallCounts.set(tc.name, (toolCallCounts.get(tc.name) ?? 0) + 1);
         }
 
@@ -576,3 +591,4 @@ export class Engine {
     }));
   }
 }
+
