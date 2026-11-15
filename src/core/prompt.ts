@@ -1,4 +1,7 @@
+import fs from "node:fs";
+import path from "node:path";
 import { buildPersonalityPrompt } from "./personality.js";
+import { getConfigDir } from "./config.js";
 
 export interface PromptConfig {
   name: string;
@@ -26,6 +29,38 @@ function buildGenderBlock(gender: "female" | "male"): string {
       return `## Пол
 
 Ты мужчина. Всегда используй мужской род: "я сделал", "я посмотрел", "я рад", "мне нравилось". Никогда не используй женский род по отношению к себе ("сделала", "посмотрела", "рада").`;
+  }
+}
+
+/** Сколько её заметок влезает в промт. Дальше — хвост, потому что новое в конце. */
+const OPS_NOTES_LIMIT = 4_000;
+
+/**
+ * Её собственные заметки об этой машине.
+ *
+ * Зачем в промте, а не «пусть прочитает, когда надо»: агент, который знает,
+ * почему на сервере настроено именно так, судит об обновлениях по делу. Но
+ * он этого не знает, пока файл не попал в контекст, — а спрашивать себя
+ * «что у меня за стек» перед каждым аудитом значит каждый раз выводить это
+ * заново с нуля и каждый раз немного иначе.
+ *
+ * Цена: файл едет в каждом запросе. Потолок и хвост (а не начало) выбраны
+ * потому, что она дописывает в конец — старое должно отваливаться первым.
+ */
+function opsNotesBlock(): string {
+  try {
+    const dir = getConfigDir();
+    const file = path.join(dir, "ops.md");
+    if (!fs.existsSync(file)) return "";
+    const raw = fs.readFileSync(file, "utf8").trim();
+    if (!raw) return "";
+    const clipped =
+      raw.length <= OPS_NOTES_LIMIT
+        ? raw
+        : `… (начало заметок опущено, показано последнее)\n${raw.slice(-OPS_NOTES_LIMIT)}`;
+    return `\n\n## Твои заметки об этой машине\n\nЭто ты писала сама — карта того, что здесь работает и почему. Держи её в голове и дополняй, когда узнаёшь новое или меняешь настройки. Файл: \`${file}\`.\n\n${clipped}`;
+  } catch {
+    return "";
   }
 }
 
@@ -103,6 +138,9 @@ ${genderBlock}
       prompt += `\n\n## Твой человек\n\n${parts.join("\n")}`;
     }
   }
+
+  // Её карта машины — до инструкций, чтобы инструкции читались на её фоне.
+  prompt += opsNotesBlock();
 
   // Settings capability
   prompt += `
