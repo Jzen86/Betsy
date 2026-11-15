@@ -35,4 +35,35 @@ describe("вызов инструмента, приехавший текстом
     expect(stripTextToolCalls(mixed)).toBe("Посмотрела сервер.")
     expect(stripTextToolCalls(liveCase)).toBe("")
   })
+
+  it("стрим не выпускает служебный блок в чат, даже если маркер разорван", async () => {
+    const { makeTextGuard } = await import("../../src/core/engine.js")
+    const out: string[] = []
+    const guard = makeTextGuard((c) => out.push(c))
+
+    guard.push("Прокси в порядке. ")
+    guard.push("Заметки дописываю: <｜DS")
+    guard.push("ML｜ calls><｜DSML｜ invoke name=")
+    guard.push("files>…")
+    guard.flush()
+
+    expect(guard.stopped()).toBe(true)
+    // Хвост, который придерживали, теряется вместе с блоком — это цена стрима:
+    // уже отправленное назад не вернуть. Главное — теги в чат не попали.
+    expect(out.join("")).toContain("Прокси в порядке.")
+    expect(out.join("")).not.toContain("DSML")
+  })
+
+  it("нормальный стрим доходит целиком", async () => {
+    const { makeTextGuard } = await import("../../src/core/engine.js")
+    const out: string[] = []
+    const guard = makeTextGuard((c) => out.push(c))
+
+    guard.push("Всё живо, ")
+    guard.push("замечаний нет.")
+    guard.flush()
+
+    expect(guard.stopped()).toBe(false)
+    expect(out.join("")).toBe("Всё живо, замечаний нет.")
+  })
 })

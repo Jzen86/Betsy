@@ -71,6 +71,41 @@ export function stripTextToolCalls(text: string): string {
   if (at < 0) return text;
   return text.slice(0, at).trim();
 }
+
+/**
+ * Фильтр для стрима: тот же служебный блок приезжает по кускам, и если отдать
+ * его в чат, владелец увидит теги до того, как движок успеет что-то проверить.
+ * Хвост держим, чтобы маркер не разорвался между кусками.
+ */
+export function makeTextGuard(send: (chunk: string) => void): {
+  push: (chunk: string) => void;
+  flush: () => void;
+  stopped: () => boolean;
+} {
+  let pending = "";
+  let stopped = false;
+  return {
+    push(chunk: string) {
+      if (stopped) return;
+      pending += chunk;
+      if (TEXT_TOOL_SYNTAX.test(pending)) {
+        stopped = true;
+        pending = "";
+        return;
+      }
+      const keep = 12;
+      if (pending.length > keep) {
+        send(pending.slice(0, pending.length - keep));
+        pending = pending.slice(-keep);
+      }
+    },
+    flush() {
+      if (!stopped && pending) send(pending);
+      pending = "";
+    },
+    stopped: () => stopped,
+  };
+}
 const PROCESS_TIMEOUT = 300_000; // 5 minutes — soft budget, triggers graceful wrap-up
 const MAX_TOOL_OUTPUT_CHARS = 8_000; // Truncate tool outputs to prevent history bloat
 
@@ -203,9 +238,10 @@ export class Engine {
         ];
 
         // Use streaming for text responses, non-streaming for tool calls
-        const streamChunk = onProgress
-          ? (chunk: string) => onProgress({ type: "text_chunk", chunk })
+        const streamGuard = onProgress
+          ? makeTextGuard((chunk) => onProgress({ type: "text_chunk", chunk }))
           : undefined;
+        const streamChunk = streamGuard ? (chunk: string) => streamGuard.push(chunk) : undefined;
 
         const histSize = historyChars(history);
         const llmStart = Date.now();
@@ -213,6 +249,22 @@ export class Engine {
           ? await llm.chatStream(messages, streamChunk, tools.length ? tools : undefined)
           : await llm.chat(messages, tools.length ? tools : undefined);
         const llmMs = Date.now() - llmStart;
+        streamGuard?.flush();
+
+        // Служебный блок режем до того, как он уйдёт в чат или в историю.
+        const textBrokenBySyntax = looksLikeTextToolCall(response.text);
+        const safeText = textBrokenBySyntax
+          ? stripTextToolCalls(response.text ?? "")
+          : (response.text ?? "");
+        if (textBrokenBySyntax) {
+          console.log(JSON.stringify({
+            tag: "engine:bad_tool_syntax",
+            turn: turn + 1,
+            chars: response.text?.length ?? 0,
+            streamed: streamGuard?.stopped() ?? false,
+            hadToolCalls: Boolean(response.toolCalls?.length),
+          }));
+        }
 
         console.log(JSON.stringify({
           tag: "engine",
@@ -222,24 +274,18 @@ export class Engine {
           completionTokens: response.usage?.completionTokens,
           historyMessages: history.length,
           historyChars: histSize,
-          reasoning: response.text?.slice(0, 200),
+          reasoning: safeText.slice(0, 200),
           stopReason: response.stopReason,
           toolCalls: response.toolCalls?.map(t => t.name),
         }));
 
-        // Вызов инструмента, приехавший текстом, — не ответ, а поломка хода:
-        // работа не сделана, а владелец получает простыню. Просим повторить
-        // правильно один раз; если и второй раз текстом — чистим и говорим как есть.
-        if (!response.toolCalls?.length && looksLikeTextToolCall(response.text)) {
-          console.log(JSON.stringify({
-            tag: "engine:bad_tool_syntax",
-            turn: turn + 1,
-            chars: response.text?.length ?? 0,
-          }));
-          const cleaned = stripTextToolCalls(response.text ?? "");
+        // Без инструментов такой ответ — это поломка хода: работа не сделана.
+        // Просим повторить правильно один раз; если и второй раз текстом —
+        // отдаём остаток и говорим как есть.
+        if (!response.toolCalls?.length && textBrokenBySyntax) {
           if (badSyntaxTries < 1) {
             badSyntaxTries++;
-            if (cleaned) history.push({ role: "assistant", content: cleaned });
+            if (safeText) history.push({ role: "assistant", content: safeText });
             history.push({
               role: "user",
               content:
@@ -247,7 +293,7 @@ export class Engine {
             });
             continue;
           }
-          const text = cleaned || "Запуталась в вызове и ничего не сделала. Повтори, пожалуйста.";
+          const text = safeText || "Запуталась в вызове и ничего не сделала. Повтори, пожалуйста.";
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -255,7 +301,7 @@ export class Engine {
 
         // Check 1: Token budget — if context is too large, stop the loop
         if (response.usage && response.usage.promptTokens > MAX_PROMPT_TOKENS) {
-          const text = response.text || "Достигнут лимит контекста. Вот что удалось найти.";
+          const text = safeText || "Достигнут лимит контекста. Вот что удалось найти.";
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           console.log(JSON.stringify({
@@ -270,7 +316,7 @@ export class Engine {
 
         // If LLM didn't request tools, return the text response
         if (response.stopReason !== "tool_use" || !response.toolCalls?.length) {
-          const text = response.text || "...";
+          const text = safeText || "...";
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
 
@@ -302,10 +348,10 @@ export class Engine {
         // Add assistant message with tool calls to history (MOVED from before compaction check)
         history.push({
           role: "assistant",
-          content: response.text || "",
+          content: safeText,
           toolCalls: response.toolCalls,
         });
-        saveMessage(userId, msg.channelName, "assistant", response.text || "", undefined, response.toolCalls);
+        saveMessage(userId, msg.channelName, "assistant", safeText, undefined, response.toolCalls);
 
         // Execute each tool and add results to history
         for (const tc of response.toolCalls) {
