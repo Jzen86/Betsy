@@ -11,6 +11,18 @@ describe("engine runaway protection", () => {
     expect((engine as any).MAX_SAME_TOOL).toBe(8)
   })
 
+  it("цепи хода в промте берутся из констант, а не из заметок", async () => {
+    const engine = await import("../../src/core/engine.js")
+    const { limitsNote, sameToolLimitFor } = engine as any
+
+    const chat = limitsNote(sameToolLimitFor(false))
+    const service = limitsNote(sameToolLimitFor(true))
+
+    expect(chat).toContain("до 8 раз")
+    expect(service).toContain("до 12 раз")
+    expect(chat).toContain("5 минут")
+  })
+
   it("служебному ходу потолок выше: повторить там некому", async () => {
     const engine = await import("../../src/core/engine.js")
     const { sameToolLimitFor, MAX_SAME_TOOL, MAX_SAME_TOOL_SERVICE } = engine as any

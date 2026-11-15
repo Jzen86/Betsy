@@ -153,6 +153,20 @@ export function makeTextGuard(send: (chunk: string) => void): {
 const PROCESS_TIMEOUT = 300_000; // 5 minutes — soft budget, triggers graceful wrap-up
 const MAX_TOOL_OUTPUT_CHARS = 8_000; // Truncate tool outputs to prevent history bloat
 
+/**
+ * Пределы хода — в промте, а не в характере и не в заметках.
+ *
+ * Живой случай (15.11): она честно сказала «конкретных цифр в характере нет,
+ * числа у меня в ops.md с твоих слов», и это правда — цифры в характере
+ * устаревают в тот день, когда их меняют, а в заметках живут до первого
+ * вытеснения. Поэтому число берётся из того же места, где оно применяется:
+ * спросили константу — она и сказала.
+ */
+export function limitsNote(sameToolLimit: number): string {
+  return `\n\n## Пределы одного хода
+Одним инструментом можно воспользоваться до ${sameToolLimit} раз за сообщение, шагов — до ${MAX_TURNS}, и на весь ход есть ${Math.round(PROCESS_TIMEOUT / 60_000)} минут. Если упираешься в это — собери проверки одной командой, а не по одному вопросу за вызов.`;
+}
+
 export interface EngineDeps {
   llm: { fast(): LLMClient; strong(): LLMClient };
   config: PromptConfig;
@@ -221,8 +235,10 @@ export class Engine {
       this.histories.set(userId, history);
     };
 
+    const sameToolLimit = sameToolLimitFor(msg.metadata?.scheduledTask === true);
+
     // Build system prompt with memory context
-    let systemPrompt = this.buildPromptWithMemory(msg.text, userId);
+    let systemPrompt = this.buildPromptWithMemory(msg.text, userId) + limitsNote(sameToolLimit);
 
     // Add user message (with reply context and/or images if present)
     const replyTo = msg.metadata?.replyToText as string | undefined;
@@ -252,7 +268,6 @@ export class Engine {
       let lastMediaUrl: string | undefined;
       let lastMediaPath: string | undefined;
       const toolCallCounts = new Map<string, number>();
-      const sameToolLimit = sameToolLimitFor(msg.metadata?.scheduledTask === true);
       let badSyntaxTries = 0;
       let compactionAttempted = false;
       const processStart = Date.now();
@@ -399,7 +414,7 @@ export class Engine {
           this.histories.set(userId, m);
           history = m;
           if (s) this.summaries.set(userId, s);
-          systemPrompt = this.buildPromptWithMemory(msg.text, userId);
+          systemPrompt = this.buildPromptWithMemory(msg.text, userId) + limitsNote(sameToolLimit);
           continue;
         }
 
