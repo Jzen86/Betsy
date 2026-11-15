@@ -36,6 +36,32 @@ describe("command-guard", () => {
     }
   })
 
+  it("не даёт читать ключи и настройки", () => {
+    for (const cmd of [
+      "cat /root/.betsy/config.yaml",
+      "head -20 /root/.betsy/config.yaml.bak-20261104",
+      "grep -r api_key /root/.betsy",
+      "cat /opt/zadrot-bot/.env",
+      "cp /root/.betsy/config.yaml /tmp/x",
+      "python3 -c 'print(1)' /root/.betsy/config.yaml",
+    ]) {
+      const verdict = checkCommand(cmd)
+      expect(verdict.allowed, cmd).toBe(false)
+      expect(verdict.why, cmd).toBeTruthy()
+    }
+  })
+
+  it("но имена файлов и свою кладовую смотреть можно", () => {
+    for (const cmd of [
+      "ls -la /root/.betsy",
+      "find /root/.betsy -name config.yaml",
+      "cat /root/.betsy/files/ops.md",
+      "grep -n telemt /root/.betsy/files/ops.md",
+    ]) {
+      expect(checkCommand(cmd).allowed, cmd).toBe(true)
+    }
+  })
+
   it("не срабатывает на безобидное слово из старого списка", () => {
     // Раньше «format» в тексте команды блокировал её целиком.
     expect(checkCommand("grep -rn format src/ | head").allowed).toBe(true)

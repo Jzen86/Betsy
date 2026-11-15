@@ -102,6 +102,30 @@ function unwrap(tokens: string[]): string | null {
   return null
 }
 
+/** Файлы, которые ей читать не нужно: ключи, токены, настройки. */
+const SECRET_FILE =
+  /(^|\/)(\.env(\.[^/]*)?|auth\.json|credentials\.json|id_rsa|id_ed25519|authorized_keys|\.netrc)$|\.(pem|key|p12|pfx|crt)$|(^|\/)config\.ya?ml(\.[^/]*)?$/i
+
+/**
+ * Бинарники, которые печатают содержимое (или копируют его).
+ * `ls`, `find` без `-exec` и `stat` только называют файл и остаются открытыми.
+ */
+const CONTENT_READERS = new Set([
+  "cat", "tac", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
+  "sed", "awk", "cut", "sort", "uniq", "strings", "xxd", "od", "hexdump",
+  "base64", "tar", "cp", "scp", "rsync", "python", "python3", "node", "jq", "yq",
+  "diff", "md5sum", "sha256sum", "wc", "file", "tee", "dd", "vim", "nano", "ed",
+])
+
+/** Каталог её конфига и данных. Кладовая (`files/`) открыта — это её документы. */
+const DATA_DIR = /(^|\/)\.betsy(\/|$)/
+
+function leakyPath(token: string): boolean {
+  if (SECRET_FILE.test(token)) return true
+  if (DATA_DIR.test(token) && !/\.betsy\/files(\/|$)/.test(token)) return true
+  return false
+}
+
 function checkSegment(segment: string): string | null {
   const tokens = tokensOf(segment)
   if (tokens.length === 0) return null
@@ -113,6 +137,12 @@ function checkSegment(segment: string): string | null {
   }
 
   const bin = tokens[0].split("/").pop() ?? tokens[0]
+
+  // Секреты: читать их ей незачем, а попав в историю, они едут в каждый промт.
+  // `ls`, `find` и `stat` файл только называют — их не трогаем.
+  if (CONTENT_READERS.has(bin) && tokens.some(leakyPath)) {
+    return "Это файл с ключами или настройками — его содержимое не читается. Скажи ему, если нужен параметр."
+  }
 
   if (FORBIDDEN_BINARIES.has(bin)) {
     return `«${bin}» перезагружает или гасит машину — это делаю не я.`
