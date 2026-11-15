@@ -23,6 +23,8 @@ import type { LLMClient } from "./core/llm/types.js";
 import type { Channel } from "./channels/types.js";
 import { sshTool } from "./core/tools/ssh.js";
 import { npmInstallTool } from "./core/tools/npm-install.js";
+import { ServerStatusTool } from "./core/tools/server-status.js";
+import { RestartServiceTool } from "./core/tools/restart-service.js";
 import { SelfieTool } from "./core/tools/selfie.js";
 import { VoiceTool } from "./core/tools/voice.js";
 import { ImageGenTool } from "./core/tools/image-gen.js";
@@ -119,6 +121,11 @@ async function main() {
   tools.register(scheduler.tool);
   if (toolFlags.ssh === true) tools.register(sshTool);
   if (toolFlags.npm_install === true) tools.register(npmInstallTool);
+  // Осмотр сервера — без свободного shell: набор команд фиксирован в коде, поэтому
+  // подтверждение не нужно. Перезапуск — отдельный инструмент, только для двух
+  // сервисов и только по флагу: это действие, а не наблюдение.
+  tools.register(new ServerStatusTool());
+  if (toolFlags.restart === true) tools.register(new RestartServiceTool());
   // channels map is populated later — closure captures the reference
   const channels = new Map<string, Channel>();
   tools.register(new ConnectServiceTool({
