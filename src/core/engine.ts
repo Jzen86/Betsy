@@ -29,6 +29,22 @@ const MAX_TURNS = 20;
 const MAX_HISTORY = 40;
 export const MAX_PROMPT_TOKENS = 128_000;
 export const MAX_SAME_TOOL = 5;
+
+/**
+ * Потолок для служебного хода (плановое задание).
+ *
+ * В чате обрыв стоит одного «повтори», и владелец рядом. У служебного хода
+ * повторить некому, а работа длиннее: осмотр сервера — это `systemctl`,
+ * журнал, API, доки, nginx, обновления, то есть шесть-восемь вызовов ещё до
+ * того, как она начнёт думать. Живой случай первого же осмотра: упёрлась в
+ * шесть и не закончила.
+ */
+export const MAX_SAME_TOOL_SERVICE = 12;
+
+/** Какой потолок брать: чат или служебный ход. */
+export function sameToolLimitFor(scheduled: boolean): number {
+  return scheduled ? MAX_SAME_TOOL_SERVICE : MAX_SAME_TOOL;
+}
 const PROCESS_TIMEOUT = 300_000; // 5 minutes — soft budget, triggers graceful wrap-up
 const MAX_TOOL_OUTPUT_CHARS = 8_000; // Truncate tool outputs to prevent history bloat
 
@@ -131,6 +147,7 @@ export class Engine {
       let lastMediaUrl: string | undefined;
       let lastMediaPath: string | undefined;
       const toolCallCounts = new Map<string, number>();
+      const sameToolLimit = sameToolLimitFor(msg.metadata?.scheduledTask === true);
       let compactionAttempted = false;
       const processStart = Date.now();
 
@@ -286,13 +303,16 @@ export class Engine {
         }
 
         // Check 2: Per-tool limit (scoped to current process() call only)
-        const overused = [...toolCallCounts.entries()].find(([, count]) => count > MAX_SAME_TOOL);
+        const overused = [...toolCallCounts.entries()].find(([, count]) => count > sameToolLimit);
         if (overused) {
           console.log(JSON.stringify({
             tag: "engine:limit",
             reason: "tool_limit",
             tool: overused[0],
             count: overused[1],
+            // Какой потолок сработал: у чата и у служебного хода они разные,
+            // и без этого поля два случая в журнале неотличимы.
+            limit: sameToolLimit,
           }));
           // Give LLM one final chance to summarize what it found (no tools)
           history.push({ role: "user", content: `Лимит использования инструмента "${overused[0]}" достигнут. Ответь на основе уже полученной информации.` });
