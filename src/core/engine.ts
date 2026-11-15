@@ -29,7 +29,7 @@ function historyChars(history: LLMMessage[]): number {
 const MAX_TURNS = 20;
 const MAX_HISTORY = 40;
 export const MAX_PROMPT_TOKENS = 128_000;
-export const MAX_SAME_TOOL = 20;
+export const MAX_SAME_TOOL = 8;
 
 /**
  * Потолок для служебного хода (плановое задание).
@@ -39,17 +39,8 @@ export const MAX_SAME_TOOL = 20;
  * журнал, API, доки, nginx, обновления, то есть шесть-восемь вызовов ещё до
  * того, как она начнёт думать. Живой случай первого же осмотра: упёрлась в
  * шесть и не закончила.
- *
- * Числа не с потолка, а по наблюдению за день 15.11: её обходы упирались в
- * 5, потом в 8 (обновление telemt: бэкап, скачивание, сверка суммы, замена,
- * рестарт, четыре проверки — восемь вызовов и ещё не конец), притом что
- * каждый вызов был нужным. Дальше держит не счётчик, а время: ход ограничен
- * пятью минутами и двадцатью шагами, поэтому дорогущий цикл упрётся в них.
  */
-export const MAX_SAME_TOOL_SERVICE = 30;
-
-/** Общий предохранитель: вызовов за один ход, по всем инструментам сразу. */
-export const MAX_TOTAL_TOOL_CALLS = 40;
+export const MAX_SAME_TOOL_SERVICE = 12;
 
 /** Какой потолок брать: чат или служебный ход. */
 export function sameToolLimitFor(scheduled: boolean): number {
@@ -261,7 +252,6 @@ export class Engine {
       let lastMediaUrl: string | undefined;
       let lastMediaPath: string | undefined;
       const toolCallCounts = new Map<string, number>();
-      let totalCalls = 0;
       const sameToolLimit = sameToolLimitFor(msg.metadata?.scheduledTask === true);
       let badSyntaxTries = 0;
       let compactionAttempted = false;
@@ -467,28 +457,6 @@ export class Engine {
         // Increment tool counts for this cycle
         for (const tc of effectiveCalls) {
           toolCallCounts.set(tc.name, (toolCallCounts.get(tc.name) ?? 0) + 1);
-          totalCalls++;
-        }
-
-        // Общий предохранитель: даже если каждый вызов «своего» инструмента
-        // не перебрал, ход не должен превращаться в бесконечную работу.
-        if (totalCalls > MAX_TOTAL_TOOL_CALLS) {
-          console.log(JSON.stringify({
-            tag: "engine:limit",
-            reason: "total_tool_limit",
-            total: totalCalls,
-            limit: MAX_TOTAL_TOOL_CALLS,
-          }));
-          history.push({ role: "user", content: `Общий лимит вызовов инструментов (${MAX_TOTAL_TOOL_CALLS}) достигнут. Ответь на основе уже полученного.` });
-          const wrapMessages: LLMMessage[] = [
-            { role: "system", content: systemPrompt },
-            ...history,
-          ];
-          const wrapResponse = await llm.chat(wrapMessages);
-          const text = await this.shorten(safeForUser(wrapResponse.text, "total_tool_limit") || "Вот что удалось сделать.");
-          history.push({ role: "assistant", content: text });
-          saveMessage(userId, msg.channelName, "assistant", text);
-          return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
         }
 
         // Check 2: Per-tool limit (scoped to current process() call only)
