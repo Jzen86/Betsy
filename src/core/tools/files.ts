@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, mkdir } from "node:fs/promises"
+import { readFile, writeFile, appendFile, readdir, mkdir } from "node:fs/promises"
 import nodePath from "node:path"
 import os from "node:os"
 import type { Tool, ToolResult } from "./types.js"
@@ -40,11 +40,11 @@ function inVault(p: string): boolean {
 
 export class FilesTool implements Tool {
   name = "files"
-  description = "Read, write, or list files. Чтение — где угодно, кроме конфига, ключей и базы; запись — только в ~/.betsy/files."
+  description = "Read, write, or list files. Чтение — где угодно, кроме конфига, ключей и базы; запись и дозапись — только в ~/.betsy/files."
   parameters = [
-    { name: "action", type: "string", description: "Action to perform: read, write, or list", required: true },
+    { name: "action", type: "string", description: "Action to perform: read, write, append, or list", required: true },
     { name: "path", type: "string", description: "File or directory path", required: true },
-    { name: "content", type: "string", description: "Content to write (required for write action)" },
+    { name: "content", type: "string", description: "Content to write or append (for write/append action)" },
   ]
 
   async execute(params: Record<string, unknown>): Promise<ToolResult> {
@@ -60,10 +60,12 @@ export class FilesTool implements Tool {
         return this.read(path)
       case "write":
         return this.write(path, params.content as string | undefined)
+      case "append":
+        return this.append(path, params.content as string | undefined)
       case "list":
         return this.list(path)
       default:
-        return { success: false, output: "", error: `Unknown action: ${action}. Use read, write, or list.` }
+        return { success: false, output: "", error: `Unknown action: ${action}. Use read, write, append, or list.` }
     }
   }
 
@@ -99,8 +101,32 @@ export class FilesTool implements Tool {
     }
   }
 
-  private async list(path: string): Promise<ToolResult> {
+  /**
+   * Дозапись в конец. Отдельное действие, а не «прочитай и перепиши»: её
+   * заметки растут снизу, и перезапись целого файла ради одной строки — это
+   * шанс потерять всё написанное из-за обрыва хода.
+   */
+  private async append(path: string, content: string | undefined): Promise<ToolResult> {
+    if (content === undefined) {
+      return { success: false, output: "", error: "Missing required parameter: content (for append action)" }
+    }
+    if (isSecret(path) || !inVault(path)) {
+      return {
+        success: false,
+        output: "",
+        error: `Дописывать можно только в ${VAULT}. Конфиг, ключи, база и код закрыты.`,
+      }
+    }
+    await mkdir(nodePath.dirname(nodePath.resolve(expand(path))), { recursive: true }).catch(() => {})
     try {
+      await appendFile(path, content, "utf-8")
+      return { success: true, output: `Appended to ${path}` }
+    } catch (err) {
+      return { success: false, output: "", error: (err as Error).message }
+    }
+  }
+
+  private async list(path: string): Promise<ToolResult> {    try {
       const entries = await readdir(path)
       return { success: true, output: entries.join("\n") }
     } catch (err) {

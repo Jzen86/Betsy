@@ -19,7 +19,11 @@ describe("ShellTool", () => {
   it("blocks dangerous commands", async () => {
     const result = await tool.execute({ command: "rm -rf /" })
     expect(result.success).toBe(false)
-    expect(result.error).toContain("blocked")
+    // Отказ теперь формулирует command-guard, и он говорит по-русски:
+    // «Команда отклонена: <почему>». Проверяем не слово, а сам факт отказа
+    // с объяснением — иначе тест держит формулировку, а не поведение.
+    expect(result.error).toContain("отклонена")
+    expect(result.error?.length).toBeGreaterThan(20)
   })
 
   it("returns error for missing command", async () => {

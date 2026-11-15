@@ -50,7 +50,10 @@ const OPS_NOTES_LIMIT = 4_000;
 function opsNotesBlock(): string {
   try {
     const dir = getConfigDir();
-    const file = path.join(dir, "ops.md");
+    // Записи в кладовой, а не рядом с конфигом: `files` пишет только туда, и
+    // заметки — документ, а не конфиг. Иначе дописать их можно было бы только
+    // через shell, экранируя переводы строк.
+    const file = path.join(dir, "files", "ops.md");
     if (!fs.existsSync(file)) return "";
     const raw = fs.readFileSync(file, "utf8").trim();
     if (!raw) return "";
@@ -58,7 +61,7 @@ function opsNotesBlock(): string {
       raw.length <= OPS_NOTES_LIMIT
         ? raw
         : `… (начало заметок опущено, показано последнее)\n${raw.slice(-OPS_NOTES_LIMIT)}`;
-    return `\n\n## Твои заметки об этой машине\n\nЭто ты писала сама — карта того, что здесь работает и почему. Держи её в голове и дополняй, когда узнаёшь новое или меняешь настройки. Файл: \`${file}\`.\n\n${clipped}`;
+    return `\n\n## Твои заметки об этой машине\n\nЭто ты писала сама — карта того, что здесь работает и почему. Держи её в голове и дополняй, когда узнаёшь новое или меняешь настройки. Дописывай в конец через \`files\` (action: append), не переписывай целиком. Файл: \`${file}\`.\n\n${clipped}`;
   } catch {
     return "";
   }

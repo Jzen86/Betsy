@@ -6,19 +6,21 @@ import path from "node:path"
 /**
  * Заметки агента об этой машине попадают в промт.
  *
- * Проверяем именно поведение: во временном каталоге конфига создаём ops.md и
+ * Проверяем поведение: во временном каталоге конфига создаём files/ops.md и
  * смотрим, что он оказался в системном промте. Иначе «карта в голове» зависит
  * от того, догадается ли агент прочитать файл, — а он не догадается.
  */
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "betsy-ops-"))
 const prevHome = process.env.HOME
 const prevProfile = process.env.USERPROFILE
+const notesDir = path.join(tmpHome, ".betsy", "files")
+const notesFile = path.join(notesDir, "ops.md")
 
 beforeAll(() => {
   // os.homedir() на Windows читает USERPROFILE, на Linux — HOME.
   process.env.HOME = tmpHome
   process.env.USERPROFILE = tmpHome
-  fs.mkdirSync(path.join(tmpHome, ".betsy"), { recursive: true })
+  fs.mkdirSync(notesDir, { recursive: true })
 })
 
 afterAll(() => {
@@ -39,7 +41,7 @@ describe("ops notes in prompt", () => {
 
   it("заметки попадают в промт, когда файл есть", () => {
     fs.writeFileSync(
-      path.join(tmpHome, ".betsy", "ops.md"),
+      notesFile,
       "telemt — MTProto-прокси, конфиг в /etc/telemt. Ребут не делаю сама.",
     )
 
@@ -47,12 +49,14 @@ describe("ops notes in prompt", () => {
 
     expect(prompt).toContain("заметки об этой машине")
     expect(prompt).toContain("MTProto-прокси")
+    // Файл лежит в кладовой, потому что `files` пишет только туда.
+    expect(prompt).toContain(notesFile)
   })
 
   it("длинные заметки режутся с конца: свежее важнее старого", () => {
     const head = "СТАРОЕ_НАЧАЛО "
     const filler = "x".repeat(8_000)
-    fs.writeFileSync(path.join(tmpHome, ".betsy", "ops.md"), `${head}${filler}СВЕЖЕЕ_КОНЕЦ`)
+    fs.writeFileSync(notesFile, `${head}${filler}СВЕЖЕЕ_КОНЕЦ`)
 
     const prompt = buildSystemPrompt(base)
 
