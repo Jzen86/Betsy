@@ -29,7 +29,7 @@ function historyChars(history: LLMMessage[]): number {
 const MAX_TURNS = 20;
 const MAX_HISTORY = 40;
 export const MAX_PROMPT_TOKENS = 128_000;
-export const MAX_SAME_TOOL = 5;
+export const MAX_SAME_TOOL = 8;
 
 /**
  * Потолок для служебного хода (плановое задание).
