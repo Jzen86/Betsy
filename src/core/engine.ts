@@ -74,6 +74,25 @@ export function stripTextToolCalls(text: string): string {
 }
 
 /**
+ * Ответ, который уходит владельцу, чистится в любом пути.
+ *
+ * Живой случай (15.11): основной цикл чистил текст, а «последний шанс» после
+ * лимита инструментов — нет. Она упёрлась в лимит, модель дописала «уже
+ * набрала достаточно» и вызов блоком, и 6.2 КБ тегов уехали в чат мимо всех
+ * проверок. Каждый путь, который отдаёт текст человеку, обязан звать это.
+ */
+export function safeForUser(text: string | undefined | null, where = "final"): string {
+  const raw = text ?? "";
+  if (!looksLikeTextToolCall(raw)) return raw;
+  console.log(JSON.stringify({
+    tag: "engine:bad_tool_syntax",
+    where,
+    chars: raw.length,
+  }));
+  return stripTextToolCalls(raw);
+}
+
+/**
  * Фильтр для стрима: тот же служебный блок приезжает по кускам, и если отдать
  * его в чат, владелец увидит теги до того, как движок успеет что-то проверить.
  * Хвост держим, чтобы маркер не разорвался между кусками.
@@ -225,7 +244,7 @@ export class Engine {
             ...history,
           ];
           const finalResponse = await llm.chat(finalMessages);
-          const text = finalResponse.text || "Не удалось завершить задачу полностью, но вот что получилось.";
+          const text = safeForUser(finalResponse.text, "timeout") || "Не удалось завершить задачу полностью, но вот что получилось.";
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -435,7 +454,7 @@ export class Engine {
             ...history,
           ];
           const finalResponse = await llm.chat(finalMessages);
-          const text = finalResponse.text || `Инструмент "${overused[0]}" использован ${overused[1]} раз, но не удалось сформировать ответ.`;
+          const text = safeForUser(finalResponse.text, "tool_limit") || `Инструмент "${overused[0]}" использован ${overused[1]} раз, но не удалось сформировать ответ.`;
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -452,7 +471,7 @@ export class Engine {
         ...history,
       ];
       const wrapResponse = await llm.chat(wrapMessages);
-      const text = wrapResponse.text || "Вот что удалось сделать.";
+      const text = safeForUser(wrapResponse.text, "max_turns") || "Вот что удалось сделать.";
       history.push({ role: "assistant", content: text });
       saveMessage(userId, msg.channelName, "assistant", text);
       return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -475,7 +494,7 @@ export class Engine {
           ...history,
         ];
         const recoveryResponse = await llm.chat(recoveryMessages);
-        const text = recoveryResponse.text || "Прости, что-то у меня зависло. Повтори, пожалуйста!";
+        const text = safeForUser(recoveryResponse.text, "recovery") || "Прости, что-то у меня зависло. Повтори, пожалуйста!";
         history.push({ role: "assistant", content: text });
         saveMessage(userId, msg.channelName, "assistant", text);
         return { text };
@@ -591,4 +610,5 @@ export class Engine {
     }));
   }
 }
+
 

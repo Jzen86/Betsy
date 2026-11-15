@@ -54,6 +54,14 @@ describe("вызов инструмента, приехавший текстом
     expect(out.join("")).not.toContain("DSML")
   })
 
+  it("safeForUser чистит любой путь ответа, включая «последний шанс»", async () => {
+    const { safeForUser } = await import("../../src/core/engine.js")
+    const wall = `Уже набрала достаточно. Записываю и говорю.\n\n${liveCase}`
+    expect(safeForUser(wall, "tool_limit")).toBe("Уже набрала достаточно. Записываю и говорю.")
+    expect(safeForUser("обычный ответ")).toBe("обычный ответ")
+    expect(safeForUser(undefined)).toBe("")
+  })
+
   it("нормальный стрим доходит целиком", async () => {
     const { makeTextGuard } = await import("../../src/core/engine.js")
     const out: string[] = []
