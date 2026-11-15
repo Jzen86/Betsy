@@ -93,6 +93,30 @@ export function safeForUser(text: string | undefined | null, where = "final"): s
 }
 
 /**
+ * Сколько символов терпит человек в чате.
+ *
+ * Живой случай (15.11): «отчёт» на 6201 символ в телеграме — это три экрана
+ * текста. Просьба «пиши коротко» в характере не сработала: длинного было
+ * много, и модель выкладывала его целиком. Поэтому предел проверяется в коде,
+ * а не берётся на честное слово: длинный ответ переписывается один раз, и
+ * если всё равно длинный — режется с честной пометкой.
+ *
+ * Подробности при этом не теряются: они уже в заметках (`ops.md`), куда
+ * задания велят писать.
+ */
+export const MAX_CHAT_CHARS = 900;
+export const HARD_CHAT_CHARS = 1400;
+
+/** Обрезает по границе строки/предложения, чтобы не рвать слово. */
+export function clipForChat(text: string, limit = HARD_CHAT_CHARS): string {
+  if (text.length <= limit) return text;
+  const slice = text.slice(0, limit);
+  const cut = Math.max(slice.lastIndexOf("\n"), slice.lastIndexOf(". "), slice.lastIndexOf("! "))
+  const body = cut > 200 ? slice.slice(0, cut + 1) : slice
+  return `${body.trim()}\n\n…(сократила; подробности в заметках)`;
+}
+
+/**
  * Фильтр для стрима: тот же служебный блок приезжает по кускам, и если отдать
  * его в чат, владелец увидит теги до того, как движок успеет что-то проверить.
  * Хвост держим, чтобы маркер не разорвался между кусками.
@@ -244,7 +268,7 @@ export class Engine {
             ...history,
           ];
           const finalResponse = await llm.chat(finalMessages);
-          const text = safeForUser(finalResponse.text, "timeout") || "Не удалось завершить задачу полностью, но вот что получилось.";
+          const text = await this.shorten(safeForUser(finalResponse.text, "timeout") || "Не удалось завершить задачу полностью, но вот что получилось.");
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -350,7 +374,7 @@ export class Engine {
 
         // If LLM didn't request tools, return the text response
         if (effectiveCalls.length === 0) {
-          const text = safeText || "...";
+          const text = await this.shorten(safeText || "...");
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
 
@@ -454,7 +478,7 @@ export class Engine {
             ...history,
           ];
           const finalResponse = await llm.chat(finalMessages);
-          const text = safeForUser(finalResponse.text, "tool_limit") || `Инструмент "${overused[0]}" использован ${overused[1]} раз, но не удалось сформировать ответ.`;
+          const text = await this.shorten(safeForUser(finalResponse.text, "tool_limit") || `Инструмент "${overused[0]}" использован ${overused[1]} раз, но не удалось сформировать ответ.`);
           history.push({ role: "assistant", content: text });
           saveMessage(userId, msg.channelName, "assistant", text);
           return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -471,7 +495,7 @@ export class Engine {
         ...history,
       ];
       const wrapResponse = await llm.chat(wrapMessages);
-      const text = safeForUser(wrapResponse.text, "max_turns") || "Вот что удалось сделать.";
+      const text = await this.shorten(safeForUser(wrapResponse.text, "max_turns") || "Вот что удалось сделать.");
       history.push({ role: "assistant", content: text });
       saveMessage(userId, msg.channelName, "assistant", text);
       return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
@@ -572,8 +596,32 @@ export class Engine {
     this.compactionInFlight.set(userId, promise);
   }
 
-  /** Execute a single tool by name. Returns full ToolResult. */
-  private async executeTool(name: string, args: Record<string, unknown>, userId?: string): Promise<ToolResult> {
+  /**
+   * Укорачивает ответ для чата. Один запрос; если и он вернул длинно — режем.
+   * Подробности не теряются: они в заметках, куда задания велят писать.
+   */
+  private async shorten(text: string): Promise<string> {
+    if (text.length <= MAX_CHAT_CHARS) return text;
+    console.log(JSON.stringify({ tag: "engine:too_long", chars: text.length }));
+    try {
+      const response = await this.deps.llm.fast().chat([
+        { role: "system", content: "Ты сокращаешь готовый ответ, не меняя его смысла." },
+        {
+          role: "user",
+          content:
+            "Сожми это до трёх коротких строк: вывод и что делать. Без вступлений, без заголовков, без списков. Подробности уже записаны отдельно.\n\n" +
+            text,
+        },
+      ]);
+      const short = (response.text ?? "").trim();
+      if (short) return short.length > HARD_CHAT_CHARS ? clipForChat(short) : short;
+    } catch (err) {
+      console.error("Shorten failed:", err);
+    }
+    return clipForChat(text);
+  }
+
+  /** Execute a single tool by name. Returns full ToolResult. */  private async executeTool(name: string, args: Record<string, unknown>, userId?: string): Promise<ToolResult> {
     const tool = this.deps.tools.get(name);
     if (!tool) {
       return { success: false, output: "", error: `unknown tool "${name}"` };
@@ -610,5 +658,7 @@ export class Engine {
     }));
   }
 }
+
+
 
 

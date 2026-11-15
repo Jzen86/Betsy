@@ -62,6 +62,17 @@ describe("вызов инструмента, приехавший текстом
     expect(safeForUser(undefined)).toBe("")
   })
 
+  it("clipForChat режет длинный ответ по границе и говорит, что сократил", async () => {
+    const { clipForChat, HARD_CHAT_CHARS } = await import("../../src/core/engine.js")
+    const long = Array.from({ length: 200 }, (_, i) => `Строка ${i} с текстом отчёта.`).join("\n")
+
+    const clipped = clipForChat(long)
+
+    expect(clipped.length).toBeLessThanOrEqual(HARD_CHAT_CHARS + 60)
+    expect(clipped).toContain("сократила")
+    expect(clipForChat("короткий ответ")).toBe("короткий ответ")
+  })
+
   it("нормальный стрим доходит целиком", async () => {
     const { makeTextGuard } = await import("../../src/core/engine.js")
     const out: string[] = []
