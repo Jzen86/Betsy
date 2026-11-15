@@ -45,6 +45,32 @@ export const MAX_SAME_TOOL_SERVICE = 12;
 export function sameToolLimitFor(scheduled: boolean): number {
   return scheduled ? MAX_SAME_TOOL_SERVICE : MAX_SAME_TOOL;
 }
+
+/**
+ * Вызов инструмента, написанный текстом.
+ *
+ * Живой случай (15.11, первый обход сервера): модель отдала весь вызов
+ * инструмента в `content` своим нативным синтаксисом — `<|DSML| calls>` /
+ * `<|DSML| invoke name="files">`. Движок увидел обычный текст, отправил его
+ * владельцу простынёй на 6.6 КБ и закрыл ход; заметка, которую она «написала»,
+ * не попала никуда — файл не изменился.
+ *
+ * Тихо вырезать недостаточно: работа не сделана. Поэтому такие ответы
+ * ловятся, в журнал пишется `engine:bad_tool_syntax`, и модель просят
+ * повторить настоящими `tool_calls`.
+ */
+const TEXT_TOOL_SYNTAX = /<[|｜]\s*(DSML|tool_calls|function_calls)|<\/[|｜]\s*(DSML|invoke|tool_calls)/i;
+
+export function looksLikeTextToolCall(text: string | undefined | null): boolean {
+  return typeof text === "string" && TEXT_TOOL_SYNTAX.test(text);
+}
+
+/** Оставляет только то, что было до служебного блока. */
+export function stripTextToolCalls(text: string): string {
+  const at = text.search(TEXT_TOOL_SYNTAX);
+  if (at < 0) return text;
+  return text.slice(0, at).trim();
+}
 const PROCESS_TIMEOUT = 300_000; // 5 minutes — soft budget, triggers graceful wrap-up
 const MAX_TOOL_OUTPUT_CHARS = 8_000; // Truncate tool outputs to prevent history bloat
 
@@ -148,6 +174,7 @@ export class Engine {
       let lastMediaPath: string | undefined;
       const toolCallCounts = new Map<string, number>();
       const sameToolLimit = sameToolLimitFor(msg.metadata?.scheduledTask === true);
+      let badSyntaxTries = 0;
       let compactionAttempted = false;
       const processStart = Date.now();
 
@@ -199,6 +226,32 @@ export class Engine {
           stopReason: response.stopReason,
           toolCalls: response.toolCalls?.map(t => t.name),
         }));
+
+        // Вызов инструмента, приехавший текстом, — не ответ, а поломка хода:
+        // работа не сделана, а владелец получает простыню. Просим повторить
+        // правильно один раз; если и второй раз текстом — чистим и говорим как есть.
+        if (!response.toolCalls?.length && looksLikeTextToolCall(response.text)) {
+          console.log(JSON.stringify({
+            tag: "engine:bad_tool_syntax",
+            turn: turn + 1,
+            chars: response.text?.length ?? 0,
+          }));
+          const cleaned = stripTextToolCalls(response.text ?? "");
+          if (badSyntaxTries < 1) {
+            badSyntaxTries++;
+            if (cleaned) history.push({ role: "assistant", content: cleaned });
+            history.push({
+              role: "user",
+              content:
+                "Ты написала вызов инструмента текстом — так он не выполняется. Вызовы делаются только через tool_calls. Если нужен инструмент, вызови его; если нет — ответь обычным текстом, без служебных блоков.",
+            });
+            continue;
+          }
+          const text = cleaned || "Запуталась в вызове и ничего не сделала. Повтори, пожалуйста.";
+          history.push({ role: "assistant", content: text });
+          saveMessage(userId, msg.channelName, "assistant", text);
+          return { text, mediaUrl: lastMediaUrl, mediaPath: lastMediaPath };
+        }
 
         // Check 1: Token budget — if context is too large, stop the loop
         if (response.usage && response.usage.promptTokens > MAX_PROMPT_TOKENS) {
