@@ -175,16 +175,77 @@ function checkSegment(segment: string): string | null {
   return null
 }
 
+/** Разворачивает $() и `...`, возвращая их содержимое. Глубина ограничена. */
+function substitutionsOf(command: string): string[] {
+  const found: string[] = []
+
+  // $( ... ) с учётом вложенности
+  let i = 0
+  while (i < command.length) {
+    if (command[i] === "$" && command[i + 1] === "(") {
+      let depth = 1
+      let j = i + 2
+      while (j < command.length && depth > 0) {
+        if (command[j] === "(") depth++
+        else if (command[j] === ")") depth--
+        j++
+      }
+      found.push(command.slice(i + 2, Math.max(i + 2, j - 1)))
+      i = j
+      continue
+    }
+    if (command[i] === "`") {
+      const end = command.indexOf("`", i + 1)
+      if (end > i) {
+        found.push(command.slice(i + 1, end))
+        i = end + 1
+        continue
+      }
+    }
+    i++
+  }
+
+  return found
+}
+
+/** Убирает подстановки из строки, чтобы проверить внешнюю команду отдельно. */
+function withoutSubstitutions(command: string): string {
+  return command
+    .replace(/\$\([^)]*\)/g, "x")
+    .replace(/`[^`]*`/g, "x")
+}
+
 /** Вердикт по команде: пускать или объяснить, почему нет. */
 export function checkCommand(command: string): Verdict {
-  if (/\$\(|`|\beval\b/.test(command)) {
-    return {
-      allowed: false,
-      why: "В команде подстановка ($(...), обратные кавычки или eval) — её содержимое проверить нельзя. Перепиши без неё.",
+  // eval выполняет строку, которую нельзя прочитать заранее — только отказ.
+  if (/\beval\b/.test(command)) {
+    return { allowed: false, why: "eval выполняет строку, которую здесь не прочитать." }
+  }
+
+  // Подстановки проверяются по содержимому, а не запрещаются целиком: `$(ls -t
+  // /var/log | head -1)` — обычный приём, и запрещать его значит мешать работе
+  // (живой случай: она дважды не смогла посмотреть свежий лог). Опасное внутри
+  // по-прежнему ловится — проверка рекурсивная.
+  for (const inner of substitutionsOf(command)) {
+    const verdict = checkCommand(inner)
+    if (!verdict.allowed) return verdict
+  }
+
+  // `rm -rf $(cat list)` — цель подставляется из файла, и проверить её нельзя:
+  // рекурсивная проверка увидит только `cat list`. Такие цели запрещены.
+  for (const segment of splitSegments(command)) {
+    const tokens = tokensOf(segment)
+    const bin = (tokens[0] ?? "").split("/").pop() ?? tokens[0] ?? ""
+    const recursive = isRecursive(tokens.slice(1).filter((t) => t.startsWith("-")))
+    if ((bin === "rm" || bin === "chmod" || bin === "chown") && recursive && /\$\(|`/.test(segment)) {
+      return {
+        allowed: false,
+        why: `Цель ${bin} подставляется командой — проверить, что именно удаляется или меняется, нельзя.`,
+      }
     }
   }
 
-  for (const segment of splitSegments(command)) {
+  for (const segment of splitSegments(withoutSubstitutions(command))) {
     const why = checkSegment(segment)
     if (why) return { allowed: false, why }
   }

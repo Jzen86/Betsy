@@ -42,10 +42,20 @@ describe("command-guard", () => {
     expect(checkCommand("grep -c 'mkfs' /var/log/syslog").allowed).toBe(true)
   })
 
-  it("отклоняет подстановку: её содержимое проверить нельзя", () => {
-    for (const cmd of ["rm -rf $(cat paths.txt)", "echo `reboot`", "eval $X"]) {
-      expect(checkCommand(cmd).allowed, cmd).toBe(false)
-    }
+  it("отклоняет eval: строку нельзя прочитать заранее", () => {
+    expect(checkCommand("eval $X").allowed).toBe(false)
+  })
+
+  it("подстановку проверяет по содержимому, а не запрещает её", () => {
+    // Живой случай: эти две команды она пробовала и получила отказ.
+    expect(checkCommand("tail -n 15 $(ls -t /var/log/telemt/* | head -1)").allowed).toBe(true)
+    expect(checkCommand("echo `date`").allowed).toBe(true)
+    // А опасное внутри — по-прежнему ловится.
+    expect(checkCommand("echo $(rm -rf /etc)").allowed).toBe(false)
+    expect(checkCommand("echo `shutdown -h now`").allowed).toBe(false)
+    expect(checkCommand("ls $(echo $(rm -rf /var))").allowed).toBe(false)
+    // Цель rm, подставленная командой, непроверяема — отказ.
+    expect(checkCommand("rm -rf $(cat paths.txt)").allowed).toBe(false)
   })
 
   it("режет по сегментам, а не по всей строке", () => {
