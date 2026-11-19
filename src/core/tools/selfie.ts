@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Tool, ToolResult } from "./types.js";
 import { uploadToFal } from "../fal-upload.js";
-import { buildWorkflow, sizeFor, type ComfyClient } from "../comfy.js";
+import { buildWorkflow, sizeFor, resolveFormat, formatList, type AspectFormat, type ComfyClient } from "../comfy.js";
 
 const FAL_ENDPOINT = "https://fal.run/xai/grok-imagine-image/edit";
 const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
@@ -61,6 +61,7 @@ export class SelfieTool implements Tool {
   parameters = [
     { name: "context", type: "string", description: "Описание сцены (в кафе, в новом платье, на пляже) — по-английски, конкретно и телесно.", required: true },
     { name: "mode", type: "string", description: "Необязательно: mirror — если буквально нужно у зеркала, direct — крупный план. По умолчанию — обычный кадр.", required: false },
+    { name: "format", type: "string", description: `Формат кадра: ${formatList()}. По умолчанию 3:4 (вертикаль).`, required: false },
   ];
 
   readonly config: SelfieToolConfig;
@@ -106,12 +107,30 @@ export class SelfieTool implements Tool {
     const provider = this.config.provider ?? "fal";
     const apiKey = provider === "openrouter" ? this.config.openrouterApiKey : this.config.falApiKey;
 
+    const mode = this.resolveMode(params, context);
+    const prompt = buildPrompt(context, mode);
+    // The frame is the model's choice per scene; a missing or unknown name lands
+    // on 3:4, because a selfie is a standing woman, not a coaster.
+    const format = resolveFormat(String(params.format ?? ""), "3:4");
+
+    // Local first: the reference photo goes in as the face and the prompt as the scene.
+    // It needs no API key at all, so it is tried before the key check — a frame drawn on
+    // the owner's GPU is free, and it is the only path that keeps her face on a spicy
+    // request (the hosted model drops a real person's photo as soon as it balks).
+    //
+    // This used to sit *after* the key check, which meant a bot configured for the local
+    // drawer alone refused to draw: "нужен ключ OpenRouter" for a path that never talks
+    // to OpenRouter. The key is the cloud path's business, so it is checked when the
+    // cloud path is actually taken.
+    const local = await this.tryComfy(prompt, format);
+    if (local) return local;
+
     if (!apiKey) {
       return {
         success: false,
         output: provider === "openrouter"
-          ? "Для генерации селфи нужен ключ OpenRouter. Сохрани через self_config."
-          : "Для генерации селфи нужен API-ключ fal.ai. Попроси пользователя получить ключ на https://fal.ai/dashboard/keys и прислать его тебе. Сохрани через self_config с ключом fal_api_key.",
+          ? "Локальный генератор недоступен, а ключа OpenRouter нет. Сохрани через self_config или подними ComfyUI."
+          : "Локальный генератор недоступен, а ключа fal.ai нет. Попроси пользователя получить ключ на https://fal.ai/dashboard/keys и прислать его тебе. Сохрани через self_config с ключом fal_api_key.",
       };
     }
 
@@ -122,23 +141,13 @@ export class SelfieTool implements Tool {
       };
     }
 
-    const mode = this.resolveMode(params, context);
-    const prompt = buildPrompt(context, mode);
-
-    // Local first: the reference photo goes in as the face and the prompt as the scene.
-    // It needs no API key at all, so it is tried before the key check — a frame drawn on
-    // the owner's GPU is free, and it is the only path that keeps her face on a spicy
-    // request (the hosted model drops a real person's photo as soon as it balks).
-    const local = await this.tryComfy(prompt);
-    if (local) return local;
-
     if (provider === "openrouter") {
       return this.generateOpenRouter(prompt, mode);
     }
     return this.generateFal(prompt, mode);
   }
 
-  private async tryComfy(prompt: string): Promise<ToolResult | null> {
+  private async tryComfy(prompt: string, format: AspectFormat): Promise<ToolResult | null> {
     const comfy = this.config.comfy;
     const ref = this.config.referencePhotoUrl;
     if (!comfy || !ref || ref.startsWith("http") || ref.startsWith("data:")) return null;
@@ -146,7 +155,7 @@ export class SelfieTool implements Tool {
       const ext = path.extname(ref) || ".jpg";
       const mime = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
       const referenceName = await comfy.upload(fs.readFileSync(ref), `betsy_selfie${ext}`, mime);
-      const { width, height } = sizeFor("3:4");
+      const { width, height } = sizeFor(format);
       const graph = buildWorkflow({ prompt, referenceName, width, height });
       const image = await comfy.generate(graph);
       console.log("📸 Selfie(comfy) OK");

@@ -56,22 +56,27 @@ export interface ComfyGraphOptions {
 }
 
 /**
- * Output formats: one long side of 896, and three frames.
+ * Output formats: five frames on two pixel budgets.
  *
- * 896 is a multiple of 32 — Qwen-Image 2.1's VAE is /16 and its patch is 2, so a
- * side that is not a multiple of 32 gets padded — and it is enough for a phone
- * screen without paying for pixels nobody looks at. It is also where the budget
- * lands: 896×896 is 0.80 megapixels and 672×896 is 0.60, against 1.05 for the
- * 1024×1024 this replaced, and the same rule costs roughly a quarter less time on
- * every frame (4.6 s against 5.6 s, 8 steps, warm).
+ * Every side is a multiple of 32 — Qwen-Image 2.1's VAE is /16 and its patch is
+ * 2, so a side that is not a multiple of 32 gets padded. The budget is what the
+ * eye and the clock notice: 896×896 is 0.80 megapixels, 672×896 is 0.60, and the
+ * same rule costs roughly a quarter less time than the 1024×1024 this replaced
+ * (4.6 s against 5.6 s, 8 steps, warm).
  *
- * Three frames, not six. A square for two people in the shot, a portrait for a
- * whole figure, a landscape when the scene needs width — and Eva picks between
- * them from the scene, which is why each carries a word she can read. 2:3, 4:5
- * and 9:16 were dropped: at a fixed 896 side they land at 0.55 and below, and
- * under about half a megapixel Qwen starts to smear. The square stays the
- * heaviest of the three deliberately — it is the pair frame, where two faces
- * share the pixels, and that is the one place the budget buys something.
+ * The three frames that were here first sit on a 896 long side: a square (the
+ * pair frame, where two faces share the pixels — the one place the extra budget
+ * buys something), a portrait for a whole figure, a landscape when the scene
+ * needs width. 9:16 and 16:9 were asked for by the owner afterwards, and they do
+ * NOT fit that rule: at 896 long side they land at 504×896 and 896×504, 0.45 MP,
+ * under the half-megapixel mark where Qwen starts to smear. So they take a 1024
+ * long side instead — 576×1024 and 1024×576, 0.59 MP, the same budget as the
+ * portrait. Two long sides, one rule: each frame gets 0.6 MP or a little more.
+ *
+ * 2:3, 4:5 and 1:1-at-1024 were dropped rather than carried: at the 896 side
+ * they fall under half a megapixel, at 1024 they cost pixels nobody looks at.
+ * Bringing one back means deciding which of those two prices to pay, not just
+ * adding a row here.
  *
  * `label` is the word the tool descriptions use for the format, and those
  * descriptions are built from this table (`formatList`) rather than written
@@ -86,13 +91,28 @@ export const FORMATS = {
   "1:1": { width: 896, height: 896, label: "квадрат" },
   "3:4": { width: 672, height: 896, label: "вертикаль" },
   "4:3": { width: 896, height: 672, label: "горизонталь" },
+  "9:16": { width: 576, height: 1024, label: "сторис" },
+  "16:9": { width: 1024, height: 576, label: "широкий" },
 } as const;
 
 export type AspectFormat = keyof typeof FORMATS;
 
+/**
+ * Which frame a name means, or the fallback when it names none.
+ *
+ * A tool gets the format from the model, so it can arrive empty, misspelled or
+ * as a word it made up. Falling back to 1:1 silently would be the worst answer
+ * for a selfie (a square crop of a full figure); each caller names its own
+ * fallback instead, and the tools pick 3:4.
+ */
+export function resolveFormat(format: string | undefined, fallback: AspectFormat = "1:1"): AspectFormat {
+  const key = (format ?? "").trim();
+  return (key in FORMATS ? (key as AspectFormat) : fallback);
+}
+
 /** Size for a named format; anything unknown falls back to 1:1. */
 export function sizeFor(format: string | undefined): { width: number; height: number } {
-  const frame = FORMATS[(format ?? "") as AspectFormat] ?? FORMATS["1:1"];
+  const frame = FORMATS[resolveFormat(format)];
   // Only the two numbers: this gets spread into the graph, and a stray field
   // would ride along into the workflow.
   return { width: frame.width, height: frame.height };

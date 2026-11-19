@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Tool, ToolResult } from "./types.js";
-import { buildWorkflow, sizeFor, type ComfyClient } from "../comfy.js";
+import { buildWorkflow, sizeFor, resolveFormat, formatList, type AspectFormat, type ComfyClient } from "../comfy.js";
 
 /** Working OpenRouter image model (gemini-2.0-flash-exp:free no longer exists). */
 const MODEL = "google/gemini-2.5-flash-image";
@@ -82,6 +82,7 @@ export class ImageGenTool implements Tool {
     "Если в кадре должна быть ты сама — это не сюда, а в selfie.";
   parameters = [
     { name: "prompt", type: "string", description: "Detailed description of the scene/framing (in English). Describe pose, clothes, place, mood — NOT the face (the reference provides the face).", required: true },
+    { name: "format", type: "string", description: `Frame format: ${formatList()}. Defaults to 3:4.`, required: false },
   ];
 
   private apiKey: string;
@@ -105,13 +106,13 @@ export class ImageGenTool implements Tool {
    * and, on a spicy request, drops it entirely. A failure here is not an error the owner
    * should hear about: it falls through to the cloud, and the cloud path answers.
    */
-  private async tryComfy(prompt: string): Promise<string | null> {
+  private async tryComfy(prompt: string, format: AspectFormat): Promise<string | null> {
     if (!this.comfy) return null;
     try {
       // No reference on this path: `image_gen` is for a frame that is *not* her — another
       // woman, a scene, an object. Attaching her photo here made every "picture" carry her
       // face, which is the opposite of what the tool is for.
-      const { width, height } = sizeFor("3:4");
+      const { width, height } = sizeFor(format);
       const graph = buildWorkflow({ prompt, width, height });
       return await this.comfy.generate(graph);
     } catch (err) {
@@ -200,7 +201,8 @@ export class ImageGenTool implements Tool {
     // Local first, and with the prompt as written: ComfyUI runs on the owner's GPU and
     // has no content filter at all, so softening it there costs the frame for nothing.
     // The moderation-friendly rewrite below belongs to the hosted model only.
-    const local = await this.tryComfy(prompt);
+    const format = resolveFormat(String(params.format ?? ""), "3:4");
+    const local = await this.tryComfy(prompt, format);
     if (local) {
       console.log("image_gen OK (comfy, qwen-image-2.1-turbo, +reference)");
       return { success: true, output: "Image generated successfully", mediaUrl: local };
