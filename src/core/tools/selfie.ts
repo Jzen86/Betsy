@@ -22,6 +22,18 @@ const IDENTITY =
   "IMPORTANT: keep the EXACT same person as in the reference image — same face, facial features, hair color and hairstyle. Do NOT invent a new face.";
 
 /**
+ * The same lesson as `image-gen`: "Селфи сгенерировано" tells her nothing about
+ * where the picture went, so she looks for a file — and the copy she sends wins
+ * over the picture in delivery.
+ */
+const LOCAL_SELFIE_SENT =
+  "Селфи готово и уходит в чат этим же ответом. Файла на диске нет — искать путь, " +
+  "копировать в /tmp и звать send_file не нужно: отправлять его отдельно нечем.";
+/** Cloud selfies come as a link, so "no file" would be a lie. */
+const CLOUD_SELFIE_SENT =
+  "Селфи готово и уходит в чат этим же ответом. Не ищи файл и не зови send_file — оно прикладывается само.";
+
+/**
  * A frame with her in it — not a phone in her hand.
  *
  * The old template made every selfie a mirror shot or an arm's-length close-up, because
@@ -51,13 +63,23 @@ export interface SelfieToolConfig {
   openrouterModel?: string;
   /** Local ComfyUI, tried before anything paid. */
   comfy?: ComfyClient;
+  /**
+   * Draw only on the owner's GPU; never touch a paid provider.
+   *
+   * Set from `comfy.local_only` in the config. When ComfyUI is unreachable the
+   * tool says so instead of silently shipping the same request to OpenRouter —
+   * that was the owner's call ("Опенроутер пока ненужен"), and a silent cloud
+   * answer is worse than a refused one: it costs money he did not agree to.
+   */
+  localOnly?: boolean;
 }
 
 export class SelfieTool implements Tool {
   name = "selfie";
   description =
     "Фото, на котором ты. Любой кадр с тобой в главной роли: портрет, в полный рост, в сцене — кто и чем снимал, неважно и не указывается. " +
-    "Лицо берётся с референса, поэтому его не описывай — описывай сцену: поза, одежда или её отсутствие, место, свет, настроение.";
+    "Лицо берётся с референса, поэтому его не описывай — описывай сцену: поза, одежда или её отсутствие, место, свет, настроение. " +
+    "Готовый кадр уходит в чат сам, этим же ответом: не ищи файл на диске, не зови send_file и не пиши «сейчас отправлю» без вызова.";
   parameters = [
     { name: "context", type: "string", description: "Описание сцены (в кафе, в новом платье, на пляже) — по-английски, конкретно и телесно.", required: true },
     { name: "mode", type: "string", description: "Необязательно: mirror — если буквально нужно у зеркала, direct — крупный план. По умолчанию — обычный кадр.", required: false },
@@ -125,6 +147,15 @@ export class SelfieTool implements Tool {
     const local = await this.tryComfy(prompt, format);
     if (local) return local;
 
+    if (this.config.localOnly) {
+      return {
+        success: false,
+        output:
+          "Локальный генератор сейчас не отвечает (ComfyUI), а облако выключено — кадра не будет. " +
+          "Попробую позже; если это повторяется, скажи владельцу, что лёг туннель к его машине.",
+      };
+    }
+
     if (!apiKey) {
       return {
         success: false,
@@ -159,7 +190,7 @@ export class SelfieTool implements Tool {
       const graph = buildWorkflow({ prompt, referenceName, width, height });
       const image = await comfy.generate(graph);
       console.log("📸 Selfie(comfy) OK");
-      return { success: true, output: "Селфи сгенерировано", mediaUrl: image };
+      return { success: true, output: LOCAL_SELFIE_SENT, mediaUrl: image };
     } catch (err) {
       console.error(`📸 Selfie: comfy failed: ${err instanceof Error ? err.message : err}`);
       return null;
@@ -198,7 +229,7 @@ export class SelfieTool implements Tool {
         return { success: false, output: "fal.ai не вернул изображение", error: "No image in response" };
       }
       console.log(`📸 Selfie(fal) OK: ${imageUrl.slice(0, 80)}`);
-      return { success: true, output: "Селфи сгенерировано", mediaUrl: imageUrl };
+      return { success: true, output: CLOUD_SELFIE_SENT, mediaUrl: imageUrl };
     } catch (err) {
       console.error(`📸 Selfie exception: ${err instanceof Error ? err.message : err}`);
       return { success: false, output: "Ошибка при генерации селфи", error: err instanceof Error ? err.message : String(err) };
@@ -290,7 +321,7 @@ export class SelfieTool implements Tool {
 
     const first = await this.callOpenRouterModel(primary, refUrl, prompt, mode);
     if (first.image) {
-      return { success: true, output: "Селфи сгенерировано", mediaUrl: first.image };
+      return { success: true, output: CLOUD_SELFIE_SENT, mediaUrl: first.image };
     }
     if (first.filter) {
       return {
@@ -303,7 +334,7 @@ export class SelfieTool implements Tool {
     const secondary = this.config.openrouterModel ? primary : OPENROUTER_FALLBACK_MODEL;
     const second = await this.callOpenRouterModel(secondary, refUrl, prompt, mode);
     if (second.image) {
-      return { success: true, output: "Селфи сгенерировано", mediaUrl: second.image };
+      return { success: true, output: CLOUD_SELFIE_SENT, mediaUrl: second.image };
     }
     if (second.filter) {
       return {

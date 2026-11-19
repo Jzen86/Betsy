@@ -163,8 +163,14 @@ async function main() {
   // of it. Images and voice keep their own accounts.
   const openrouterKey = (config as any).providers?.openrouter?.api_key as string | undefined;
   const comfyUrl = (config as any).comfy?.url as string | undefined;
+  // Owner's call (19.11): images are drawn on his GPU only. The cloud path stays
+  // in the code — reopen it by flipping this key back, not by editing tools.
+  const comfyLocalOnly = (config as any).comfy?.local_only !== false;
   const comfyClient = comfyUrl ? new ComfyClient({ baseUrl: comfyUrl }) : undefined;
-  if (comfyClient) console.log(`🖼 ComfyUI: ${comfyUrl}`);
+  if (comfyClient) console.log(`🖼 ComfyUI: ${comfyUrl}${comfyLocalOnly ? " (только локально)" : ""}`);
+  if (comfyLocalOnly && !comfyClient) {
+    console.log("⚠️ comfy.local_only включён, а comfy.url не задан — картинок не будет вовсе");
+  }
   const selfieTool = new SelfieTool({
     falApiKey: selfiesConfig?.fal_api_key ?? videoConfig?.fal_api_key ?? "",
     referencePhotoUrl: selfiesConfig?.reference_photo_url,
@@ -172,6 +178,7 @@ async function main() {
     openrouterApiKey: selfiesConfig?.openrouter_api_key ?? openrouterKey ?? "",
     openrouterModel: selfiesConfig?.openrouter_model,
     comfy: comfyClient,
+    localOnly: comfyLocalOnly,
   });
   tools.register(selfieTool);
   // Voice tool — lets Betsy send voice messages on her own initiative
@@ -181,8 +188,14 @@ async function main() {
   }));
   // Image generation tool — uses OpenRouter API key
   const llmApiKey = getLLMApiKey(config);
-  if (llmApiKey) {
-    tools.register(new ImageGenTool({ apiKey: openrouterKey ?? llmApiKey, comfy: comfyClient }));
+  if (llmApiKey || comfyClient) {
+    tools.register(new ImageGenTool({
+      // A key is only needed when the cloud path can actually be taken; passing the
+      // chat key here made every local failure look like an OpenRouter auth error.
+      apiKey: comfyLocalOnly ? "" : (openrouterKey ?? llmApiKey ?? ""),
+      comfy: comfyClient,
+      localOnly: comfyLocalOnly,
+    }));
   }
   // SkillsMP tools — search and install agent skills
   const skillsmpKey = (config as any).skillsmp?.api_key as string | undefined;

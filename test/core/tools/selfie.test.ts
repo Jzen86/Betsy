@@ -157,4 +157,52 @@ describe("SelfieTool", () => {
       fs.unlinkSync(ref);
     }
   });
+
+  it("says the selfie is on its way, so she stops hunting for the file", async () => {
+    const ref = path.join(os.tmpdir(), `betsy-selfie-ref2-${process.pid}.jpg`);
+    fs.writeFileSync(ref, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    try {
+      const comfy = {
+        upload: async () => "betsy_selfie.jpg",
+        generate: async () => "data:image/png;base64,AA==",
+      };
+      const tool = new SelfieTool({ falApiKey: "", referencePhotoUrl: ref, comfy: comfy as never, localOnly: true });
+      const result = await tool.execute({ context: "на пляже" });
+
+      expect(result.success).toBe(true);
+      expect(result.output).toContain("в чат этим же ответом");
+      expect(result.output).toContain("send_file");
+    } finally {
+      fs.unlinkSync(ref);
+    }
+  });
+
+  it("does not reach for a paid provider when the local drawer is down", async () => {
+    const ref = path.join(os.tmpdir(), `betsy-selfie-ref3-${process.pid}.jpg`);
+    fs.writeFileSync(ref, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const comfy = {
+        upload: async () => "betsy_selfie.jpg",
+        generate: async () => { throw new Error("fetch failed"); },
+      };
+      const tool = new SelfieTool({
+        falApiKey: "",
+        openrouterApiKey: "sk-or-test",
+        provider: "openrouter",
+        referencePhotoUrl: ref,
+        comfy: comfy as never,
+        localOnly: true,
+      });
+      const result = await tool.execute({ context: "на пляже" });
+
+      expect(result.success).toBe(false);
+      expect(result.output).toContain("ComfyUI");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+      fs.unlinkSync(ref);
+    }
+  });
 });

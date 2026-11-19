@@ -196,6 +196,16 @@ function chunkText(text: string, maxLen: number): string[] {
 /** File extension to Telegram send method mapping. */
 const VIDEO_EXTS = new Set([".mp4", ".webm", ".mkv", ".avi", ".mov"]);
 const AUDIO_EXTS = new Set([".mp3", ".ogg", ".wav", ".flac", ".m4a", ".aac", ".opus"]);
+/**
+ * Pictures go out as photos, not documents.
+ *
+ * `send_file` on a `.png` used to fall through to `replyWithDocument`, and the
+ * owner saw a file icon with a name instead of the picture in the message: she
+ * generated a frame (which the engine already attaches), then went hunting for
+ * it on disk and sent it again "properly" — as a document. A photo bubble is
+ * what both paths mean; a file is only right when the file itself is the point.
+ */
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp"]);
 
 /** Runtime options for audio/video delivery (voice config, keys, avatar path). */
 export interface AudioOptions {
@@ -205,7 +215,7 @@ export interface AudioOptions {
 }
 
 /** Deliver an OutgoingMessage through the appropriate Telegram media type. */
-async function deliver(ctx: Context, response: OutgoingMessage, audio?: AudioOptions): Promise<void> {
+export async function deliver(ctx: Context, response: OutgoingMessage, audio?: AudioOptions): Promise<void> {
   const mode = response.mode ?? "text";
 
   // If response has a local file to send
@@ -217,7 +227,16 @@ async function deliver(ctx: Context, response: OutgoingMessage, audio?: AudioOpt
       const parseMode = caption ? ("HTML" as const) : undefined;
       const file = new InputFile(response.mediaPath);
 
-      if (VIDEO_EXTS.has(ext)) {
+      // A generated frame is attached by the engine (`mediaUrl`) and a file of it
+      // is a second copy: she saves the picture she just drew and sends it again,
+      // and the document wins the branch below while the picture is dropped. The
+      // photo from the generator is the one to keep; the file is the duplicate.
+      if (IMAGE_EXTS.has(ext) && response.mediaUrl) {
+        console.log(JSON.stringify({ tag: "deliver", skipped: "duplicate image file", path: response.mediaPath }));
+      } else if (IMAGE_EXTS.has(ext)) {
+        await ctx.replyWithPhoto(file, { caption, parse_mode: parseMode });
+        return;
+      } else if (VIDEO_EXTS.has(ext)) {
         await ctx.replyWithVideo(file, { caption, parse_mode: parseMode });
       } else if (ext === ".ogg" || ext === ".opus") {
         await ctx.replyWithVoice(file);
@@ -226,7 +245,7 @@ async function deliver(ctx: Context, response: OutgoingMessage, audio?: AudioOpt
       } else {
         await ctx.replyWithDocument(file, { caption, parse_mode: parseMode });
       }
-      return;
+      if (!IMAGE_EXTS.has(ext)) return;
     } catch (err) {
       console.error("Failed to send file:", err instanceof Error ? err.message : err);
       // Fall through to text delivery

@@ -8,13 +8,39 @@ import { buildWorkflow, sizeFor, resolveFormat, formatList, type AspectFormat, t
 const MODEL = "google/gemini-2.5-flash-image";
 const DEFAULT_REFERENCE = path.join(os.homedir(), ".betsy", "reference.jpg");
 
-export interface ImageGenToolConfig {
+/**
+ * What the tool tells the model after a successful frame.
+ *
+ * This text is the whole fix for a real failure (19.11): the tool used to answer
+ * "Image generated successfully", the model had a picture it could not point at,
+ * and it went hunting — `find`, the ComfyUI output folder, `cp /tmp/...`, then
+ * `send_file` with that copy. The owner got a document attachment instead of the
+ * photo, because a file wins over the picture in delivery.
+ *
+ * So the answer says three things at once: the frame is already on its way in
+ * this very reply, there is no file to send, and sending it again is not needed.
+ * Keep all three — "уже в чате" alone did not stop the hunt elsewhere.
+ */
+const LOCAL_IMAGE_ALREADY_SENT =
+  "Картинка готова и уходит в чат этим же ответом. Файла на диске нет — искать путь, " +
+  "копировать в /tmp и звать send_file не нужно: отправлять её отдельно нечем.";
+/** Cloud frames come as a link, so the "no file" half would be a lie. */
+const CLOUD_IMAGE_ALREADY_SENT =
+  "Картинка готова и уходит в чат этим же ответом. Не ищи файл и не зови send_file — она прикладывается сама.";export interface ImageGenToolConfig {
   apiKey: string;
   model?: string;
   /** Path to the reference photo used to keep the same face. */
   referencePath?: string;
   /** Local ComfyUI, tried before the hosted model. */
   comfy?: ComfyClient;
+  /**
+   * Draw only on the owner's GPU; never touch the hosted model.
+   *
+   * `comfy.local_only` in the config. A silent cloud answer when ComfyUI is down
+   * would cost money the owner did not agree to; an honest "generator is down"
+   * costs one message.
+   */
+  localOnly?: boolean;
 }
 
 interface ORMessage {
@@ -79,7 +105,8 @@ export class ImageGenTool implements Tool {
     "Нарисовать кадр, где главная — НЕ Бетси: другой человек, персонаж, сцена, предмет. Её лицо здесь не используется. " +
     "Пиши промпт ПО-АНГЛИЙСКИ, конкретно и телесно: кто в кадре, внешность (если это человек), поза, одежда или её отсутствие, место, свет, настроение. " +
     "Генератор локальный (ComfyUI) и без фильтра содержимого — называй прямо то, что должно быть в кадре. " +
-    "Если в кадре должна быть ты сама — это не сюда, а в selfie.";
+    "Если в кадре должна быть ты сама — это не сюда, а в selfie. " +
+    "Готовый кадр уходит в чат сам, этим же ответом: не ищи файл на диске, не зови send_file и не пиши «сейчас отправлю» без вызова.";
   parameters = [
     { name: "prompt", type: "string", description: "Detailed description of the scene/framing (in English). Describe pose, clothes, place, mood — NOT the face (the reference provides the face).", required: true },
     { name: "format", type: "string", description: `Frame format: ${formatList()}. Defaults to 3:4.`, required: false },
@@ -89,12 +116,14 @@ export class ImageGenTool implements Tool {
   private model: string;
   private referencePath: string;
   private comfy?: ComfyClient;
+  private localOnly: boolean;
 
   constructor(config: ImageGenToolConfig) {
     this.apiKey = config.apiKey;
     this.model = config.model ?? MODEL;
     this.referencePath = config.referencePath ?? DEFAULT_REFERENCE;
     this.comfy = config.comfy;
+    this.localOnly = config.localOnly ?? false;
   }
 
   /**
@@ -204,8 +233,17 @@ export class ImageGenTool implements Tool {
     const format = resolveFormat(String(params.format ?? ""), "3:4");
     const local = await this.tryComfy(prompt, format);
     if (local) {
-      console.log("image_gen OK (comfy, qwen-image-2.1-turbo, +reference)");
-      return { success: true, output: "Image generated successfully", mediaUrl: local };
+      console.log("image_gen OK (comfy, qwen-image-2.1-turbo)");
+      return { success: true, output: LOCAL_IMAGE_ALREADY_SENT, mediaUrl: local };
+    }
+
+    if (this.localOnly) {
+      return {
+        success: false,
+        output:
+          "Локальный генератор сейчас не отвечает (ComfyUI), а облако выключено — кадра не будет. " +
+          "Попробую позже; если это повторяется, скажи владельцу, что лёг туннель к его машине.",
+      };
     }
 
     const safe = softenPrompt(prompt);
@@ -216,7 +254,7 @@ export class ImageGenTool implements Tool {
     const first = await this.callModel(safe, false);
     if (first.image) {
       console.log(`image_gen OK (${this.model}, без референса)`);
-      return { success: true, output: "Image generated successfully", mediaUrl: first.image };
+      return { success: true, output: CLOUD_IMAGE_ALREADY_SENT, mediaUrl: first.image };
     }
 
     return { success: false, output: `Не удалось сгенерировать (${first.error ?? "unknown"}).` };
