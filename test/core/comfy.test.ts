@@ -50,6 +50,13 @@ describe("frame formats", () => {
     expect(resolveFormat("9x16", "3:4")).toBe("3:4");
   });
 
+  it("accepts the word from the description as well as the key", () => {
+    // The description reads "9:16 (сторис)"; the model may hand back "сторис".
+    expect(resolveFormat("сторис")).toBe("9:16");
+    expect(resolveFormat("Широкий")).toBe("16:9");
+    expect(resolveFormat("вертикаль")).toBe("3:4");
+  });
+
   it("returns only width and height", () => {
     expect(sizeFor("16:9")).toEqual({ width: 1024, height: 576 });
     expect(Object.keys(sizeFor("1:1"))).toEqual(["width", "height"]);

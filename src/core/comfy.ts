@@ -106,8 +106,15 @@ export type AspectFormat = keyof typeof FORMATS;
  * fallback instead, and the tools pick 3:4.
  */
 export function resolveFormat(format: string | undefined, fallback: AspectFormat = "1:1"): AspectFormat {
-  const key = (format ?? "").trim();
-  return (key in FORMATS ? (key as AspectFormat) : fallback);
+  const key = (format ?? "").trim().toLowerCase();
+  if (!key) return fallback;
+  // The key itself, or the word the description shows next to it: the model
+  // reads "9:16 (сторис)" and may hand back either half.
+  if (key in FORMATS) return key as AspectFormat;
+  const byLabel = (Object.keys(FORMATS) as AspectFormat[]).find(
+    (name) => FORMATS[name].label.toLowerCase() === key,
+  );
+  return byLabel ?? fallback;
 }
 
 /** Size for a named format; anything unknown falls back to 1:1. */
