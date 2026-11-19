@@ -42,6 +42,45 @@ export const MAX_SAME_TOOL = 8;
  */
 export const MAX_SAME_TOOL_SERVICE = 12;
 
+/**
+ * Что она видит сразу после того, как нарисовала кадр.
+ *
+ * До этого тулз отвечал «уходит в чат», а сама картинка к следующему запросу не
+ * прикладывалась — то есть она рисовала вслепую и не могла ни оценить кадр, ни
+ * переделать грубый брак. Владелец видел результат, она нет.
+ *
+ * Правила в подписи — его слова (16.10): явный брак (лишняя рука/нога/голова,
+ * не то число частей) — переделать ОДИН раз и молча; мелочи вроде пальцев —
+ * оставить; в ответе кадр не описывать и про переделку не писать, он его видит.
+ */
+export const FRAME_NOTE = [
+  "Кадр, который ты только что сгенерировала, приложен к этому ходу — посмотри на него.",
+  "Явный брак (лишняя рука, нога, голова, не то число частей) — перегенерируй один раз, молча, тем же тулзом с тем же форматом.",
+  "Мелкие огрехи (пальцы, мимика, свет) — оставляй.",
+  "В ответе кадр не описывай, про переделку не пиши и не спрашивай «оставляем или перегенерируем»: владелец видит картинку сам.",
+].join(" ");
+
+/** Какие тулзы рисуют кадр, который стоит подкладывать ей же. */
+const IMAGE_TOOLS = new Set(["selfie", "image_gen"]);
+
+/**
+ * Сообщение с кадром для следующего запроса к модели — или ничего.
+ *
+ * Вынесено из цикла, чтобы это можно было проверить без базы: сам цикл тянет
+ * историю из SQLite, а правило тут простое — кадр идёт как `image_url`, ссылка
+ * облака как есть, data-URL как data-URL.
+ */
+export function framePreviewMessage(frames: string[]): LLMMessage | undefined {
+  if (!frames.length) return undefined;
+  return {
+    role: "user",
+    content: [
+      { type: "text", text: FRAME_NOTE },
+      ...frames.map((url): ContentPart => ({ type: "image_url", image_url: { url } })),
+    ],
+  };
+}
+
 /** Какой потолок брать: чат или служебный ход. */
 export function sameToolLimitFor(scheduled: boolean): number {
   return scheduled ? MAX_SAME_TOOL_SERVICE : MAX_SAME_TOOL;
@@ -267,6 +306,12 @@ export class Engine {
     try {
       let lastMediaUrl: string | undefined;
       let lastMediaPath: string | undefined;
+      /**
+       * Кадры, которые она ещё не видела. Живут ровно один запрос к модели —
+       * после ответа гасятся, чтобы картинка не ехала в контексте всю беседу и
+       * не копилась в истории (в базу она тоже не пишется).
+       */
+      let pendingFrames: string[] = [];
       const toolCallCounts = new Map<string, number>();
       let badSyntaxTries = 0;
       let compactionAttempted = false;
@@ -295,6 +340,15 @@ export class Engine {
           { role: "system", content: systemPrompt },
           ...history,
         ];
+        // Кадр рисуется в этом же ходе и прикладывается к следующему запросу:
+        // иначе она оценивает свою работу по описанию, а не по картинке.
+        if (pendingFrames.length) {
+          const preview = framePreviewMessage(pendingFrames);
+          if (preview) {
+            messages.push(preview);
+            console.log(JSON.stringify({ tag: "engine:frame_preview", frames: pendingFrames.length }));
+          }
+        }
 
         // Use streaming for text responses, non-streaming for tool calls
         const streamGuard = onProgress
@@ -308,6 +362,9 @@ export class Engine {
           ? await llm.chatStream(messages, streamChunk, tools.length ? tools : undefined)
           : await llm.chat(messages, tools.length ? tools : undefined);
         const llmMs = Date.now() - llmStart;
+        // Один показ на кадр: к следующему запросу он уже не нужен, а в истории
+        // и в базе ему делать нечего — там только текст.
+        if (pendingFrames.length) pendingFrames = [];
         streamGuard?.flush();
 
         // Служебный блок режем до того, как он уйдёт в чат или в историю.
@@ -454,6 +511,11 @@ export class Engine {
 
           if (result.mediaUrl) {
             lastMediaUrl = result.mediaUrl;
+            // Свой кадр — ей же глазами. Ссылку облака тоже показываем: она
+            // приходит как https и провайдер её подтянет.
+            if (IMAGE_TOOLS.has(tc.name) && /^(data:image\/|https?:\/\/)/.test(result.mediaUrl)) {
+              pendingFrames = [...pendingFrames, result.mediaUrl].slice(-2);
+            }
           }
           if (result.mediaPath) {
             lastMediaPath = result.mediaPath;
