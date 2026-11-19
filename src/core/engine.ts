@@ -45,13 +45,12 @@ export const MAX_SAME_TOOL_SERVICE = 12;
 /**
  * Что она видит сразу после того, как нарисовала кадр.
  *
- * До этого тулз отвечал «уходит в чат», а сама картинка к следующему запросу не
- * прикладывалась — то есть она рисовала вслепую и не могла ни оценить кадр, ни
- * переделать грубый брак. Владелец видел результат, она нет.
- *
- * Правила в подписи — его слова (16.10): явный брак (лишняя рука/нога/голова,
- * не то число частей) — переделать ОДИН раз и молча; мелочи вроде пальцев —
- * оставить; в ответе кадр не описывать и про переделку не писать, он его видит.
+ * Инструкция живёт один запрос (её подкладывают в системный промт на ход, где
+ * кадр только что появился), а сам кадр остаётся в истории — владелец просил
+ * именно это: «видит в моменте, но не в контексте». Правила в подписи — его
+ * слова (16.10): явный брак (лишняя рука/нога/голова, не то число частей) —
+ * переделать ОДИН раз и молча; мелочи вроде пальцев — оставить; в ответе кадр
+ * не описывать и про переделку не писать, он его видит.
  */
 export const FRAME_NOTE = [
   "Кадр, который ты только что сгенерировала, приложен к этому ходу — посмотри на него.",
@@ -60,25 +59,69 @@ export const FRAME_NOTE = [
   "В ответе кадр не описывай, про переделку не пиши и не спрашивай «оставляем или перегенерируем»: владелец видит картинку сам.",
 ].join(" ");
 
+/**
+ * Сколько последних кадров остаются картинками в истории.
+ *
+ * Каждый кадр — это ~700–1500 токенов промта на каждом следующем ходе. Держать
+ * все нельзя: десять картинок вытеснят из окна сам разговор. Два — свежий и
+ * предыдущий: она помнит, что нарисовала, и может вернуться к кадру в
+ * следующем сообщении, а старое остаётся подписью без байтов (см.
+ * `pruneFrameImages`).
+ */
+export const FRAME_KEEP = 2;
+
 /** Какие тулзы рисуют кадр, который стоит подкладывать ей же. */
 const IMAGE_TOOLS = new Set(["selfie", "image_gen"]);
 
+/** Подпись кадра в истории: по ней видно, что это её работа, а не фото владельца. */
+export const FRAME_MARK = "[Мой кадр";
+
+export function frameLabel(scene: string): string {
+  const trimmed = scene.trim().replace(/\s+/g, " ").slice(0, 160);
+  return trimmed ? `${FRAME_MARK}: ${trimmed}]` : `${FRAME_MARK}]`;
+}
+
 /**
- * Сообщение с кадром для следующего запроса к модели — или ничего.
+ * Сообщение с кадром в историю — картинкой, а не путём.
  *
- * Вынесено из цикла, чтобы это можно было проверить без базы: сам цикл тянет
- * историю из SQLite, а правило тут простое — кадр идёт как `image_url`, ссылка
- * облака как есть, data-URL как data-URL.
+ * Вынесено из цикла, чтобы это можно было проверить без базы: кадр идёт как
+ * `image_url`, ссылка облака как есть, data-URL как data-URL.
  */
-export function framePreviewMessage(frames: string[]): LLMMessage | undefined {
-  if (!frames.length) return undefined;
+export function frameMessage(scene: string, url: string): LLMMessage {
   return {
     role: "user",
     content: [
-      { type: "text", text: FRAME_NOTE },
-      ...frames.map((url): ContentPart => ({ type: "image_url", image_url: { url } })),
+      { type: "text", text: frameLabel(scene) },
+      { type: "image_url", image_url: { url } },
     ],
   };
+}
+
+/**
+ * Оставляет картинками только последние `keep` кадров.
+ *
+ * Старым кадрам снимаем байты, подпись оставляем: она по-прежнему знает, что
+ * такой кадр был, но перестаёт платить за него токенами и не вытесняет
+ * разговор из окна. Мутирует историю на месте — она и так живёт в памяти.
+ */
+export function pruneFrameImages(history: LLMMessage[], keep = FRAME_KEEP): number {
+  const isOwnFrame = (m: LLMMessage): boolean =>
+    m.role === "user" &&
+    Array.isArray(m.content) &&
+    m.content.some((p) => p.type === "text" && p.text.startsWith(FRAME_MARK));
+
+  const withImages: number[] = [];
+  history.forEach((m, i) => {
+    if (!isOwnFrame(m) || typeof m.content === "string") return;
+    if (m.content.some((p) => p.type === "image_url")) withImages.push(i);
+  });
+  const drop = withImages.slice(0, Math.max(0, withImages.length - keep));
+  for (const i of drop) {
+    const m = history[i];
+    const parts = (m.content as ContentPart[]).filter((p) => p.type !== "image_url");
+    history[i] = { ...m, content: parts };
+  }
+  return drop.length;
 }
 
 /** Какой потолок брать: чат или служебный ход. */
@@ -307,11 +350,11 @@ export class Engine {
       let lastMediaUrl: string | undefined;
       let lastMediaPath: string | undefined;
       /**
-       * Кадры, которые она ещё не видела. Живут ровно один запрос к модели —
-       * после ответа гасятся, чтобы картинка не ехала в контексте всю беседу и
-       * не копилась в истории (в базу она тоже не пишется).
+       * Кадр появился в этом ходе — значит к следующему запросу надо приложить
+       * инструкцию «посмотри и, если брак, переделай». Сам кадр при этом уже
+       * лежит в истории (см. ниже) и остаётся там.
        */
-      let pendingFrames: string[] = [];
+      let freshFrame = false;
       const toolCallCounts = new Map<string, number>();
       let badSyntaxTries = 0;
       let compactionAttempted = false;
@@ -337,18 +380,9 @@ export class Engine {
         onProgress?.({ type: "thinking" });
 
         const messages: LLMMessage[] = [
-          { role: "system", content: systemPrompt },
+          { role: "system", content: freshFrame ? `${systemPrompt}\n\n${FRAME_NOTE}` : systemPrompt },
           ...history,
         ];
-        // Кадр рисуется в этом же ходе и прикладывается к следующему запросу:
-        // иначе она оценивает свою работу по описанию, а не по картинке.
-        if (pendingFrames.length) {
-          const preview = framePreviewMessage(pendingFrames);
-          if (preview) {
-            messages.push(preview);
-            console.log(JSON.stringify({ tag: "engine:frame_preview", frames: pendingFrames.length }));
-          }
-        }
 
         // Use streaming for text responses, non-streaming for tool calls
         const streamGuard = onProgress
@@ -362,9 +396,9 @@ export class Engine {
           ? await llm.chatStream(messages, streamChunk, tools.length ? tools : undefined)
           : await llm.chat(messages, tools.length ? tools : undefined);
         const llmMs = Date.now() - llmStart;
-        // Один показ на кадр: к следующему запросу он уже не нужен, а в истории
-        // и в базе ему делать нечего — там только текст.
-        if (pendingFrames.length) pendingFrames = [];
+        // Инструкция про брак — на один запрос; кадр к этому моменту уже
+        // видели, и повторять ему «перегенерируй» в каждом следующем ходе не надо.
+        freshFrame = false;
         streamGuard?.flush();
 
         // Служебный блок режем до того, как он уйдёт в чат или в историю.
@@ -511,11 +545,6 @@ export class Engine {
 
           if (result.mediaUrl) {
             lastMediaUrl = result.mediaUrl;
-            // Свой кадр — ей же глазами. Ссылку облака тоже показываем: она
-            // приходит как https и провайдер её подтянет.
-            if (IMAGE_TOOLS.has(tc.name) && /^(data:image\/|https?:\/\/)/.test(result.mediaUrl)) {
-              pendingFrames = [...pendingFrames, result.mediaUrl].slice(-2);
-            }
           }
           if (result.mediaPath) {
             lastMediaPath = result.mediaPath;
@@ -527,6 +556,23 @@ export class Engine {
             toolCallId: tc.id,
           });
           saveMessage(userId, msg.channelName, "tool", resultText, tc.id);
+
+          // Кадр — ей же в историю, картинкой, и только ПОСЛЕ результата тулза:
+          // между assistant(tool_calls) и tool-сообщением вклиниваться нельзя,
+          // провайдер отвергнет ход.
+          if (result.mediaUrl && IMAGE_TOOLS.has(tc.name) && /^(data:image\/|https?:\/\/)/.test(result.mediaUrl)) {
+            const args = tc.arguments as { prompt?: unknown; context?: unknown };
+            const scene = String(args.prompt ?? args.context ?? "");
+            history.push(frameMessage(scene, result.mediaUrl));
+            saveMessage(userId, msg.channelName, "user", frameLabel(scene));
+            freshFrame = true;
+            const dropped = pruneFrameImages(history);
+            console.log(JSON.stringify({
+              tag: "engine:frame_context",
+              kept: FRAME_KEEP,
+              droppedImages: dropped,
+            }));
+          }
 
           onProgress?.({ type: "tool_end", tool: tc.name, turn: turn + 1, success: result.success });
         }
