@@ -2,6 +2,7 @@ import type { LLMClient, LLMMessage, LLMResponse, ToolDefinition, StreamCallback
 import { createOpenRouterClient } from "./providers/openrouter.js";
 import { isBillingError, isRateLimitError, checkBalance } from "./providers/openrouter.js";
 import { createCompatClient } from "./providers/openai-compat.js";
+import { RP_MODEL, RP_PROVIDER } from "./chat-route.js";
 
 const DEFAULT_FALLBACKS = [
   "openrouter/free",
@@ -107,6 +108,16 @@ export class LLMRouter {
   // Proxies returned to consumers — created once, delegate internally
   private fastProxy: LLMClient | undefined;
   private strongProxy: LLMClient | undefined;
+  /**
+   * Разговорный клиент: создаётся лениво, потому что нужен не каждому ходу.
+   *
+   * Отдельный от fast/strong намеренно: у него другая модель (её задаёт
+   * `chat-route.ts`), из истории вырезаны tool-сообщения, и он не должен
+   * подниматься вместе с деградацией основной цепочки — иначе маршрут на
+   * Гемини переживёт только первую ошибку.
+   */
+  private rpProxy: LLMClient | undefined;
+  private rpClient: LLMClient | undefined;
 
   // Fallback state
   private _mode: "normal" | "degraded" = "normal";
@@ -147,11 +158,34 @@ export class LLMRouter {
     return this.strongProxy;
   }
 
+  /**
+   * Разговорный клиент — тот, что «Гемини для болтовни».
+   *
+   * Без ключа или без провайдера бросает: движок ловит и уходит на `fast()`,
+   * то есть реплика не теряется, а просто отвечается основной моделью.
+   * Фолбэки у него общие с цепочкой (`fallbackModels`) — когда Гугл молчит,
+   * ответит то же, что ответило бы на обычном маршруте.
+   */
+  rp(): LLMClient {
+    if (!this.rpProxy) {
+      if (!this.rpClient) {
+        this.rpClient = this.createClient(RP_PROVIDER, RP_MODEL, { stripTools: true });
+      }
+      const client = this.rpClient;
+      this.rpProxy = this.createProxy(() => client);
+    }
+    return this.rpProxy;
+  }
+
   destroy(): void {
     this.stopBalanceCheck();
   }
 
-  private createClient(provider: string, model: string): LLMClient {
+  private createClient(
+    provider: string,
+    model: string,
+    extra?: { stripTools?: boolean },
+  ): LLMClient {
     const account = this.config.providers?.[provider];
     const apiKey = account?.api_key ?? (provider === this.config.provider ? this.config.api_key : undefined);
     if (!apiKey) {
@@ -175,7 +209,22 @@ export class LLMRouter {
       headers["x-opencode-session"] = `ses_betsy_${Math.random().toString(36).slice(2, 12)}`;
     }
 
-    return createCompatClient({ apiKey, model, baseURL, headers });
+    // Google's «thinking» models тратят на размышления тот же бюджет, что и на
+    // ответ, и без явного нуля отвечают коротко и поздно. Но у `*-lite` такого
+    // параметра нет — запрос с ним отбивается 400, поэтому только для не-lite.
+    // Проверено живьём на gemini-3.5-flash-lite (23.11): `reasoning_effort: none`
+    // → «Request contains an invalid argument».
+    const extraBody =
+      provider === "google" && !/lite/i.test(model) ? { reasoning_effort: "none" } : undefined;
+
+    return createCompatClient({
+      apiKey,
+      model,
+      baseURL,
+      headers,
+      extraBody,
+      stripTools: Boolean(extra?.stripTools),
+    });
   }
 
   private isRetryable(err: unknown): boolean {

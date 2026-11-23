@@ -30,7 +30,17 @@ export interface LLMStreamChunk {
 export interface LLMResponse {
   text: string;
   toolCalls?: ToolUseRequest[];
-  stopReason: "end_turn" | "tool_use" | "max_tokens";
+  /**
+   * Чем закончился ответ — и это не косметика.
+   *
+   * `incomplete` и `filtered` существуют потому, что провайдер умеет закрыть
+   * поток молча: без финального `finish_reason` (обрыв связи) или с отдачей,
+   * срезанной фильтром. Раньше оба случая переводились в `end_turn`, то есть
+   * обрубок «Ну да, по бумагам и» уходил человеку как готовая фраза
+   * (23.11, четыре ответа за вечер). Отличить их от честного «закончила»
+   * теперь можно, и движок на них переспрашивает, а не отправляет.
+   */
+  stopReason: "end_turn" | "tool_use" | "max_tokens" | "incomplete" | "filtered";
   usage?: { promptTokens: number; completionTokens: number };
 }
 

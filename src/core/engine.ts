@@ -1,5 +1,5 @@
 import type { IncomingMessage, OutgoingMessage, ProgressCallback } from "./types.js";
-import type { LLMClient, LLMMessage, ContentPart, ToolDefinition } from "./llm/types.js";
+import type { LLMClient, LLMMessage, LLMResponse, ContentPart, ToolDefinition } from "./llm/types.js";
 import type { ToolRegistry } from "./tools/registry.js";
 import type { ToolResult } from "./tools/types.js";
 import { buildSystemPrompt, type PromptConfig } from "./prompt.js";
@@ -7,6 +7,7 @@ import { searchKnowledge } from "./memory/knowledge.js";
 import { saveMessage, loadHistory, extractText } from "./memory/conversations.js";
 import { compactHistory } from "./memory/compaction.js";
 import { LLMUnavailableError } from "./llm/router.js";
+import { isSmallTalk, RP_MODEL, RP_PROVIDER, RP_ROUTER } from "./llm/chat-route.js";
 import { parseDsmlToolCalls } from "./llm/dsml.js";
 import { TokenStore } from "../services/tokens.js";
 import { getService } from "../services/catalog.js";
@@ -30,6 +31,18 @@ const MAX_TURNS = 20;
 const MAX_HISTORY = 40;
 export const MAX_PROMPT_TOKENS = 128_000;
 export const MAX_SAME_TOOL = 8;
+
+/**
+ * Ответ, который нельзя считать ответом.
+ *
+ * `incomplete` — поток закрылся без финального `finish_reason`; `filtered` —
+ * провайдер срезал отдачу фильтром; `max_tokens` — упёрлась в лимит вывода.
+ * Все три — не «закончила», а «оборвалась», и молча отправлять их человеку
+ * нельзя: 23.11 так ушли четыре реплики, оборванные на середине слова.
+ */
+function isBrokenAnswer(r: LLMResponse): boolean {
+  return r.stopReason === "incomplete" || r.stopReason === "filtered" || r.stopReason === "max_tokens";
+}
 
 /**
  * Потолок для служебного хода (плановое задание).
@@ -250,7 +263,7 @@ export function limitsNote(sameToolLimit: number): string {
 }
 
 export interface EngineDeps {
-  llm: { fast(): LLMClient; strong(): LLMClient };
+  llm: { fast(): LLMClient; strong(): LLMClient; rp(): LLMClient };
   config: PromptConfig;
   tools: ToolRegistry;
   contextBudget: number;
@@ -295,7 +308,36 @@ export class Engine {
   }
 
   async process(msg: IncomingMessage, onProgress?: ProgressCallback): Promise<OutgoingMessage> {
-    const llm = this.deps.llm.fast();
+    /**
+     * Гемини для болтовни, дипсик для работы (решение владельца 23.11).
+     *
+     * Классификатор зовётся только на короткий текст без картинок: длинное
+     * сообщение — это задание по определению, а картинку разговорная модель
+     * всё равно не увидит. Если классификатор упал или rp-клиент не собрался —
+     * молча идём обычным маршрутом: реплика важнее маршрута.
+     */
+    let llm = this.deps.llm.fast();
+    let rpMode = false;
+    if (RP_ROUTER && msg.text && !(msg.images?.length)) {
+      try {
+        rpMode = await isSmallTalk(this.deps.llm.fast(), msg.text);
+      } catch {
+        rpMode = false;
+      }
+      if (rpMode) {
+        try {
+          llm = this.deps.llm.rp();
+          console.log(JSON.stringify({ tag: "engine:route", mode: "chat", model: `${RP_PROVIDER}/${RP_MODEL}` }));
+        } catch {
+          rpMode = false;
+          llm = this.deps.llm.fast();
+          console.log(JSON.stringify({ tag: "engine:route", mode: "tool", reason: "rp_client_failed" }));
+        }
+      } else {
+        console.log(JSON.stringify({ tag: "engine:route", mode: "tool" }));
+      }
+    }
+
     const userId = msg.userId;
 
     // Wait for any in-flight compaction to finish before proceeding
@@ -343,8 +385,10 @@ export class Engine {
 
     saveMessage(userId, msg.channelName, "user", textContent);
 
-    // Build tool definitions for the LLM
-    const tools = this.buildToolDefinitions();
+    // Build tool definitions for the LLM. Разговорному маршруту инструменты не
+    // даются вовсе: классификатор уже решил, что здесь болтовня, а модель без
+    // tools не может «на полпути» уйти проверять сервер вместо ответа.
+    const tools = rpMode ? [] : this.buildToolDefinitions();
 
     try {
       let lastMediaUrl: string | undefined;
@@ -392,10 +436,46 @@ export class Engine {
 
         const histSize = historyChars(history);
         const llmStart = Date.now();
-        const response = streamChunk
+        let response = streamChunk
           ? await llm.chatStream(messages, streamChunk, tools.length ? tools : undefined)
           : await llm.chat(messages, tools.length ? tools : undefined);
         const llmMs = Date.now() - llmStart;
+
+        /**
+         * Провайдер умеет закрыть поток на полуслове и не сказать об этом.
+         *
+         * Живой случай (23.11): четыре ответа за вечер пришли обрывками —
+         * «Ну да, по бумагам и» (8 токенов), «…с юга. / Х» (38 токенов) — с
+         * `finish_reason: null` и полным временем хода. Прежний код считал это
+         * готовой репликой и записывал в историю, поэтому следующий ход
+         * продолжал с полуслова. Стриминг в Telegram выключен, человек ещё
+         * ничего не видел, поэтому переспрашиваем тот же ответ без стрима;
+         * если и второй раз обрыв — берём вариант, где текста больше.
+         * Инструменты сюда не попадают: у них `stopReason: tool_use`.
+         */
+        if (!response.toolCalls?.length && isBrokenAnswer(response)) {
+          console.log(
+            JSON.stringify({
+              tag: "engine:incomplete",
+              turn: turn + 1,
+              stopReason: response.stopReason,
+              chars: response.text?.length ?? 0,
+            }),
+          );
+          try {
+            const retry = await llm.chat(messages, tools.length ? tools : undefined);
+            if (!isBrokenAnswer(retry) || (retry.text?.length ?? 0) > (response.text?.length ?? 0)) {
+              response = retry;
+            }
+          } catch (err) {
+            console.log(
+              JSON.stringify({
+                tag: "engine:incomplete_failed",
+                message: err instanceof Error ? err.message : String(err),
+              }),
+            );
+          }
+        }
         // Инструкция про брак — на один запрос; кадр к этому моменту уже
         // видели, и повторять ему «перегенерируй» в каждом следующем ходе не надо.
         freshFrame = false;

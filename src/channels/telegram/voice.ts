@@ -61,10 +61,11 @@ export async function synthesizeSpeech(
   text: string,
   voiceConfig: Record<string, unknown>,
   falApiKey?: string,
+  style?: string,
 ): Promise<Buffer | null> {
   const provider = (voiceConfig.tts_provider as string) ?? "openai";
   if (provider === "gemini") {
-    const raw = await synthesizeGemini(text, voiceConfig);
+    const raw = await synthesizeGemini(text, voiceConfig, style);
     return raw ? raw.buffer : null;
   }
   if (provider === "minimax") {
@@ -73,17 +74,69 @@ export async function synthesizeSpeech(
   return synthesizeOpenAI(text, voiceConfig);
 }
 
-/** Gemini TTS via Google AI Studio (generateContent + AUDIO modality). */
-async function synthesizeGemini(
+/**
+ * Подача голоса — отдельным запросом к `interactions`.
+ *
+ * `generateContent` умеет только голос, но не «как сказать»: шёпот, смех,
+ * усталость в нём не передаются, и владелец просил именно этого. У нового
+ * эндпоинта стиль идёт аннотацией `speech_metadata`. Он молодой и может
+ * отвалиться (429/404), поэтому он первый, а обычный `generateContent` —
+ * второй попыткой в той же цепочке: без стиля, но с голосом.
+ */
+async function geminiInteractions(
+  model: string,
+  apiKey: string,
   text: string,
-  voiceConfig: Record<string, unknown>,
+  voiceName: string,
+  style?: string,
 ): Promise<{ buffer: Buffer; mimeType: string } | null> {
-  const apiKey = (voiceConfig.gemini_api_key ?? voiceConfig.google_api_key) as string | undefined;
-  if (!apiKey) return null;
+  try {
+    const content: Record<string, unknown> = { type: "text", text };
+    if (style) content.annotations = [{ type: "speech_metadata", style }];
 
-  const model = (voiceConfig.gemini_model as string) ?? GEMINI_DEFAULT_MODEL;
-  const voiceName = (voiceConfig.voice_id as string) ?? GEMINI_DEFAULT_VOICE;
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/interactions", {
+      method: "POST",
+      headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        input: [{ type: "user_input", content: [content] }],
+        response_format: { type: "audio" },
+        generation_config: { speech_config: [{ voice: voiceName }] },
+      }),
+    });
 
+    if (!res.ok) {
+      const why = res.status === 429 ? "quota" : String(res.status);
+      console.log(JSON.stringify({ tag: "voice:interactions_fail", model, status: res.status, why }));
+      return null;
+    }
+
+    const data = (await res.json()) as {
+      steps?: Array<{
+        content?: Array<{ type?: string; data?: string; mime_type?: string }>;
+      }>;
+    };
+    for (const step of data.steps ?? []) {
+      for (const part of step.content ?? []) {
+        if (part.data && (part.type === "audio" || part.mime_type)) {
+          return { buffer: Buffer.from(part.data, "base64"), mimeType: part.mime_type ?? "audio/wav" };
+        }
+      }
+    }
+    return null;
+  } catch (err) {
+    console.log(JSON.stringify({ tag: "voice:interactions_error", model, error: String(err).slice(0, 100) }));
+    return null;
+  }
+}
+
+/** Gemini TTS via Google AI Studio (generateContent + AUDIO modality). */
+async function geminiGenerateContentStyled(
+  model: string,
+  apiKey: string,
+  text: string,
+  voiceName: string,
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -99,7 +152,11 @@ async function synthesizeGemini(
         }),
       },
     );
-    if (!res.ok) return null;
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      console.log(JSON.stringify({ tag: "voice:tts_fail", model, status: res.status, body: body.slice(0, 100) }));
+      return null;
+    }
 
     const data = (await res.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> } }>;
@@ -115,9 +172,58 @@ async function synthesizeGemini(
       }
     }
     return null;
-  } catch {
+  } catch (err) {
+    console.log(JSON.stringify({ tag: "voice:tts_error", model, error: String(err).slice(0, 100) }));
     return null;
   }
+}
+
+/**
+ * Голос по всем моделям и всем ключам, пока хоть одна не ответит.
+ *
+ * Ключей может быть несколько (`gemini_api_keys`), как и моделей
+ * (`gemini_models`): бесплатный тир считает запросы, и один ключ с лимитом
+ * RPM — это «голос есть утром и нет вечером». Перебор идёт по модели, внутри
+ * по ключам, потому что разные модели упираются в разные лимиты.
+ */
+async function synthesizeGemini(
+  text: string,
+  voiceConfig: Record<string, unknown>,
+  style?: string,
+): Promise<{ buffer: Buffer; mimeType: string } | null> {
+  const voiceName = (voiceConfig.voice_id as string) ?? GEMINI_DEFAULT_VOICE;
+
+  const keys: string[] =
+    Array.isArray(voiceConfig.gemini_api_keys) && voiceConfig.gemini_api_keys.length
+      ? (voiceConfig.gemini_api_keys as unknown[]).filter(
+          (k): k is string => typeof k === "string" && k.trim().length > 0,
+        )
+      : [(voiceConfig.gemini_api_key ?? voiceConfig.google_api_key) as string | undefined].filter(
+          (k): k is string => Boolean(k),
+        );
+  if (!keys.length) return null;
+
+  const chain = [
+    ...(Array.isArray(voiceConfig.gemini_models) ? (voiceConfig.gemini_models as unknown[]) : []),
+    (voiceConfig.gemini_model as string) ?? GEMINI_DEFAULT_MODEL,
+  ].filter((m): m is string => typeof m === "string" && m.length > 0);
+  const models = [...new Set(chain)];
+
+  for (const model of models) {
+    for (const key of keys) {
+      const styled = await geminiInteractions(model, key, text, voiceName, style);
+      if (styled) {
+        console.log(JSON.stringify({ tag: "voice:tts_ok", model, style: style ?? null, via: "interactions" }));
+        return styled;
+      }
+      const plain = await geminiGenerateContentStyled(model, key, text, voiceName);
+      if (plain) {
+        console.log(JSON.stringify({ tag: "voice:tts_ok", model, style: null, via: "generateContent" }));
+        return plain;
+      }
+    }
+  }
+  return null;
 }
 
 async function synthesizeMiniMax(
@@ -210,10 +316,11 @@ export async function synthesizeVoiceOgg(
   text: string,
   voiceConfig: Record<string, unknown>,
   falApiKey?: string,
+  style?: string,
 ): Promise<Buffer | null> {
   const provider = (voiceConfig.tts_provider as string) ?? "openai";
   if (provider === "gemini") {
-    const raw = await synthesizeGemini(text, voiceConfig);
+    const raw = await synthesizeGemini(text, voiceConfig, style);
     if (!raw) return null;
     return toOggOpus(raw.buffer, raw.mimeType);
   }

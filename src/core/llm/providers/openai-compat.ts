@@ -21,23 +21,50 @@ export interface CompatOptions {
   model: string;
   baseURL: string;
   headers?: Record<string, string>;
+  /** Extra request fields, e.g. Google's `reasoning_effort`. */
+  extraBody?: Record<string, unknown>;
+  /**
+   * Выкинуть из истории tool-сообщения и tool_calls.
+   *
+   * Нужно разговорному маршруту: он уходит на модель, которой не дают
+   * инструменты, а чужие `tool_call_id` в промпте ломают запрос (400).
+   * Оставляем от таких реплик только текст, который модель сказала человеку.
+   */
+  stripTools?: boolean;
 }
 
-function toOpenAIMessages(messages: LLMMessage[]): OpenAI.ChatCompletionMessageParam[] {
-  return messages.map((m) => {
+export function toOpenAIMessages(
+  messages: LLMMessage[],
+  stripTools = false,
+): OpenAI.ChatCompletionMessageParam[] {
+  const out: OpenAI.ChatCompletionMessageParam[] = [];
+
+  for (const m of messages) {
+    if (stripTools && m.role === "tool") continue;
+
+    if (stripTools && m.role === "assistant" && m.toolCalls?.length) {
+      const text =
+        typeof m.content === "string"
+          ? m.content
+          : m.content.filter((p) => p.type === "text").map((p) => (p as { text: string }).text).join("\n");
+      if (text.trim()) out.push({ role: "assistant", content: text });
+      continue;
+    }
+
     if (m.role === "tool") {
-      return {
+      out.push({
         role: "tool" as const,
         tool_call_id: m.toolCallId!,
         content:
           typeof m.content === "string"
             ? m.content
             : m.content.filter((p) => p.type === "text").map((p) => (p as { text: string }).text).join("\n"),
-      };
+      });
+      continue;
     }
 
     if (m.role === "assistant" && m.toolCalls?.length) {
-      return {
+      out.push({
         role: "assistant" as const,
         content: typeof m.content === "string" ? m.content : null,
         tool_calls: m.toolCalls.map((tc) => ({
@@ -48,33 +75,83 @@ function toOpenAIMessages(messages: LLMMessage[]): OpenAI.ChatCompletionMessageP
             arguments: JSON.stringify(tc.arguments),
           },
         })),
-      };
+      });
+      continue;
     }
 
-    return {
+    out.push({
       role: m.role as "system" | "user" | "assistant",
       content: m.content,
-    } as OpenAI.ChatCompletionMessageParam;
-  });
+    } as OpenAI.ChatCompletionMessageParam);
+  }
+
+  return out;
 }
 
-function buildResponse(
+/**
+ * Причина остановки без `finish_reason` — это обрыв, а не ответ.
+ *
+ * Живой случай (23.11): провайдер закрыл поток на середине слова, финального
+ * `finish_reason` не пришло, и прежний код переводил `null` в `end_turn` —
+ * владелец получал «Ну да, по бумагам и» как законченную реплику, а движок
+ * записывал её в историю. Поэтому неизвестное и пустое теперь `incomplete`,
+ * а `length` и `content_filter` перестали притворяться нормальным концом.
+ */
+export function buildResponse(
   content: string,
   finishReason: string | null,
   toolCalls?: Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
   usage?: { prompt_tokens: number; completion_tokens: number },
 ): LLMResponse {
-  const stopReason =
-    finishReason === "tool_calls" ? "tool_use" : finishReason === "stop" ? "end_turn" : "end_turn";
+  let stopReason: LLMResponse["stopReason"];
+  if (toolCalls?.length || finishReason === "tool_calls" || finishReason === "function_call") {
+    stopReason = "tool_use";
+  } else if (finishReason === "length") {
+    stopReason = "max_tokens";
+  } else if (finishReason === "content_filter") {
+    stopReason = "filtered";
+  } else if (finishReason === "stop" || finishReason === "end_turn") {
+    stopReason = "end_turn";
+  } else {
+    stopReason = "incomplete";
+  }
 
   return {
     text: content,
     toolCalls: toolCalls?.length ? toolCalls : undefined,
-    stopReason: toolCalls?.length ? "tool_use" : stopReason,
+    stopReason,
     usage: usage
       ? { promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens }
       : undefined,
   };
+}
+
+/**
+ * Пишет неудачный запрос в журнал целиком, если владелец включил тумблер.
+ *
+ * Тело ответа провайдер в ошибку не всегда кладёт («400 status code (no body)» —
+ * так Google отвечает на запрос из неподдерживаемого региона), поэтому в
+ * журнале остаётся сам запрос: без него разбирать 400 приходилось догадками.
+ * Включается `BETSY_LLM_ERROR_LOG=1` в дропине юнита; выключен — молчит.
+ */
+function logLlmFailure(arg: Record<string, unknown>, err: unknown): void {
+  if (process.env.BETSY_LLM_ERROR_LOG !== "1") return;
+  let payload = "";
+  try {
+    payload = JSON.stringify(arg).slice(0, 1200);
+  } catch {
+    payload = "unserializable";
+  }
+  const e = err as { status?: number; statusCode?: number; message?: string } | null;
+  console.log(
+    JSON.stringify({
+      tag: "engine:llm_error",
+      model: arg.model,
+      status: e?.status ?? e?.statusCode ?? null,
+      message: String(e?.message ?? err).slice(0, 240),
+      payload,
+    }),
+  );
 }
 
 /** A client for any host that speaks the OpenAI chat protocol. */
@@ -87,11 +164,20 @@ export function createCompatClient(opts: CompatOptions): LLMClient {
 
   return {
     async chat(messages: LLMMessage[], tools?: ToolDefinition[]): Promise<LLMResponse> {
-      const res = await client.chat.completions.create({
+      const arg = {
         model: opts.model,
-        messages: toOpenAIMessages(messages),
+        messages: toOpenAIMessages(messages, opts.stripTools),
         ...(tools?.length ? { tools } : {}),
-      });
+        ...(opts.extraBody ?? {}),
+      };
+
+      let res;
+      try {
+        res = await client.chat.completions.create(arg);
+      } catch (err) {
+        logLlmFailure(arg as unknown as Record<string, unknown>, err);
+        throw err;
+      }
 
       const choice = res.choices[0];
       const message = choice?.message;
@@ -117,20 +203,32 @@ export function createCompatClient(opts: CompatOptions): LLMClient {
       onChunk: StreamCallback,
       tools?: ToolDefinition[],
     ): Promise<LLMResponse> {
-      const stream = await client.chat.completions.create({
+      const arg = {
         model: opts.model,
-        messages: toOpenAIMessages(messages),
+        messages: toOpenAIMessages(messages, opts.stripTools),
         ...(tools?.length ? { tools } : {}),
+        ...(opts.extraBody ?? {}),
         stream: true,
         stream_options: { include_usage: true },
-      });
+      };
+
+      let stream;
+      try {
+        stream = await client.chat.completions.create(arg);
+      } catch (err) {
+        logLlmFailure(arg as unknown as Record<string, unknown>, err);
+        throw err;
+      }
+      // `arg` собран переменной, поэтому перегрузка `create` отдаёт объединение
+      // «ответ или поток» и TS теряет итератор. Здесь поток по построению.
+      const chunks = stream as unknown as AsyncIterable<OpenAI.ChatCompletionChunk>;
 
       let text = "";
       let finishReason: string | null = null;
       let usage: { prompt_tokens: number; completion_tokens: number } | undefined;
       const toolCallMap = new Map<number, { id: string; name: string; args: string }>();
 
-      for await (const chunk of stream) {
+      for await (const chunk of chunks) {
         const delta = chunk.choices[0]?.delta;
         if (!delta) continue;
 
