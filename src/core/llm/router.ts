@@ -118,6 +118,17 @@ export class LLMRouter {
    */
   private rpProxy: LLMClient | undefined;
   private rpClient: LLMClient | undefined;
+  /**
+   * То, что реально отвечает разговорному маршруту прямо сейчас.
+   *
+   * Отдельно от `rpClient`, потому что при деградации роутера разговорная
+   * модель тоже обязана уехать на запасную. Живой случай 23.11: Гугл дважды
+   * ответил 503, роутер объявил «работаю на запасной», а `rpProxy` продолжал
+   * стучаться в тот же Гугл — оба `llm_error` в журнале с одной моделью, и ход
+   * умер с «All LLM models unavailable». Прокси фиксированный клиент — это
+   * ложное переключение.
+   */
+  private rpDelegate: LLMClient | undefined;
 
   // Fallback state
   private _mode: "normal" | "degraded" = "normal";
@@ -168,11 +179,9 @@ export class LLMRouter {
    */
   rp(): LLMClient {
     if (!this.rpProxy) {
-      if (!this.rpClient) {
-        this.rpClient = this.createClient(RP_PROVIDER, RP_MODEL, { stripTools: true });
-      }
-      const client = this.rpClient;
-      this.rpProxy = this.createProxy(() => client);
+      this.rpClient = this.createClient(RP_PROVIDER, RP_MODEL, { stripTools: true });
+      this.rpDelegate = this.rpClient;
+      this.rpProxy = this.createProxy(() => this.rpDelegate ?? this.rpClient!);
     }
     return this.rpProxy;
   }
@@ -332,6 +341,13 @@ export class LLMRouter {
     const client = this.createClient(provider, model);
     this.fastDelegate = client;
     this.strongDelegate = client;
+    // Разговорный маршрут уезжает вместе со всеми: иначе «переключение на
+    // запасную модель» для него — ложь, и он продолжает стучаться в упавший
+    // провайдер. `stripTools` держим: в его истории лежат tool-сообщения,
+    // и модель без инструментов на них отвечает 400.
+    if (this.rpDelegate) {
+      this.rpDelegate = this.createClient(provider, model, { stripTools: true });
+    }
   }
 
   private restoreMainModels(): void {
@@ -339,6 +355,10 @@ export class LLMRouter {
     this._mode = "normal";
     this.fastDelegate = this.createClient(this.config.provider, this.config.fast_model);
     this.strongDelegate = this.createClient(this.config.provider, this.config.strong_model);
+    if (this.rpDelegate) {
+      this.rpClient = this.createClient(RP_PROVIDER, RP_MODEL, { stripTools: true });
+      this.rpDelegate = this.rpClient;
+    }
     this.pendingNotification = "✅ Снова работаю на основной модели.";
     this.stopBalanceCheck();
   }
