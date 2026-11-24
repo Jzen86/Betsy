@@ -9,6 +9,7 @@ import { compactHistory } from "./memory/compaction.js";
 import { LLMUnavailableError } from "./llm/router.js";
 import { isSmallTalk, RP_MODEL, RP_PROVIDER, RP_ROUTER } from "./llm/chat-route.js";
 import { parseDsmlToolCalls } from "./llm/dsml.js";
+import { hasInlineToolCalls, parseInlineToolCalls, stripInlineToolCalls } from "./llm/inline-calls.js";
 import { TokenStore } from "../services/tokens.js";
 import { getService } from "../services/catalog.js";
 import { SkillsStore } from "../services/skills-store.js";
@@ -86,6 +87,19 @@ export const FRAME_KEEP = 2;
 /** Какие тулзы рисуют кадр, который стоит подкладывать ей же. */
 const IMAGE_TOOLS = new Set(["selfie", "image_gen"]);
 
+/**
+ * Что разрешено разговорному маршруту.
+ *
+ * Решение владельца (24.11): «если она хочет отправить селфи/картинку, никаких
+ * препятствий быть не должно — хоть сама хочет, хоть я требую». Раньше
+ * болталка шла с пустым списком инструментов, и её желание отправить кадр
+ * превращалось в текст `[selfie: …]` — фото не было, а «готово, лови» было.
+ *
+ * Даём только кадры: сервер, файлы и расписание — работа, а не разговор, и
+ * уводить ход в сторону от реплики здесь по-прежнему нельзя.
+ */
+const CHAT_TOOL_NAMES = new Set(["selfie", "image_gen"]);
+
 /** Подпись кадра в истории: по ней видно, что это её работа, а не фото владельца. */
 export const FRAME_MARK = "[Мой кадр";
 
@@ -158,14 +172,22 @@ export function sameToolLimitFor(scheduled: boolean): number {
 const TEXT_TOOL_SYNTAX = /<[|｜]\s*(DSML|tool_calls|function_calls)|<\/[|｜]\s*(DSML|invoke|tool_calls)/i;
 
 export function looksLikeTextToolCall(text: string | undefined | null): boolean {
-  return typeof text === "string" && TEXT_TOOL_SYNTAX.test(text);
+  if (typeof text !== "string") return false;
+  return TEXT_TOOL_SYNTAX.test(text) || hasInlineToolCalls(text);
 }
 
-/** Оставляет только то, что было до служебного блока. */
+/**
+ * Оставляет только то, что было до служебного блока, и убирает маркеры кадра.
+ *
+ * Блок DSML — это хвост вызова, после него говорить нечего, поэтому режем по
+ * нему. Маркер кадра (`[selfie: …]`) может стоять посреди реплики — его
+ * вырезаем на месте, а остальной текст оставляем: человеку она уже сказала
+ * что-то осмысленное.
+ */
 export function stripTextToolCalls(text: string): string {
   const at = text.search(TEXT_TOOL_SYNTAX);
-  if (at < 0) return text;
-  return text.slice(0, at).trim();
+  const head = at < 0 ? text : text.slice(0, at);
+  return stripInlineToolCalls(head);
 }
 
 /**
@@ -390,10 +412,10 @@ export class Engine {
 
     saveMessage(userId, msg.channelName, "user", textContent);
 
-    // Build tool definitions for the LLM. Разговорному маршруту инструменты не
-    // даются вовсе: классификатор уже решил, что здесь болтовня, а модель без
-    // tools не может «на полпути» уйти проверять сервер вместо ответа.
-    const tools = rpMode ? [] : this.buildToolDefinitions();
+    // Build tool definitions for the LLM. Разговорному маршруту даются только
+    // кадры (см. CHAT_TOOL_NAMES): сервер, файлы и расписание — это работа, а
+    // не болтовня, и уводить ход в сторону от реплики там по-прежнему нельзя.
+    const tools = rpMode ? this.buildToolDefinitions(CHAT_TOOL_NAMES) : this.buildToolDefinitions();
 
     try {
       let lastMediaUrl: string | undefined;
@@ -519,15 +541,27 @@ export class Engine {
 
         // Если внутри блока были вызовы — это не поломка, а родной язык модели:
         // переводим его в настоящие tool_calls и продолжаем работу.
-        const recoveredCalls = response.toolCalls?.length
-          ? []
-          : parseDsmlToolCalls(response.text ?? "");
-        const effectiveCalls = response.toolCalls?.length ? response.toolCalls : recoveredCalls;
+        const raw = response.text ?? "";
+        const recoveredCalls = response.toolCalls?.length ? [] : parseDsmlToolCalls(raw);
+        // Маркер кадра (`[selfie: …]`) — то же самое, только диалект болталки:
+        // она уже решила снять и описала сцену, движку осталось исполнить.
+        const inlineCalls = response.toolCalls?.length ? [] : parseInlineToolCalls(raw);
+        const effectiveCalls = response.toolCalls?.length
+          ? response.toolCalls
+          : [...recoveredCalls, ...inlineCalls];
         if (recoveredCalls.length) {
           console.log(JSON.stringify({
             tag: "engine:recovered_tool_calls",
             turn: turn + 1,
             tools: recoveredCalls.map((c) => c.name),
+          }));
+        }
+        if (inlineCalls.length) {
+          console.log(JSON.stringify({
+            tag: "engine:inline_tool_calls",
+            turn: turn + 1,
+            route: rpMode ? "chat" : "tool",
+            tools: inlineCalls.map((c) => c.name),
           }));
         }
 
@@ -657,6 +691,19 @@ export class Engine {
             toolCallId: tc.id,
           });
           saveMessage(userId, msg.channelName, "tool", resultText, tc.id);
+
+          /**
+           * Разговорный клиент выкидывает tool-сообщения из истории (ему нельзя
+           * тащить чужие tool_call_id), поэтому о провале он не узнает и легко
+           * снова напишет «готово». Даём ему это обычной репликой-служебкой:
+           * «не вышло» должно звучать честно, а не исчезать вместе с историей.
+           */
+          if (rpMode && !result.success) {
+            history.push({
+              role: "user",
+              content: `[Служебное: инструмент «${tc.name}» не сработал — ${result.error || result.output}. Не говори, что кадр или файл отправлен. Скажи честно, что не вышло, и предложи попробовать ещё раз.]`,
+            });
+          }
 
           // Кадр — ей же в историю, картинкой, и только ПОСЛЕ результата тулза:
           // между assistant(tool_calls) и tool-сообщением вклиниваться нельзя,
@@ -860,26 +907,29 @@ export class Engine {
   }
 
   /** Convert our ToolParam[] format to OpenAI function-calling ToolDefinition[]. */
-  private buildToolDefinitions(): ToolDefinition[] {
-    return this.deps.tools.list().map((tool) => ({
-      type: "function" as const,
-      function: {
-        name: tool.name,
-        description: tool.description,
-        parameters: {
-          type: "object" as const,
-          properties: Object.fromEntries(
-            tool.parameters.map((p) => [
-              p.name,
-              { type: p.type, description: p.description },
-            ]),
-          ),
-          required: tool.parameters
-            .filter((p) => p.required)
-            .map((p) => p.name),
+  private buildToolDefinitions(only?: Set<string>): ToolDefinition[] {
+    return this.deps.tools
+      .list()
+      .filter((tool) => (only ? only.has(tool.name) : true))
+      .map((tool) => ({
+        type: "function" as const,
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: {
+            type: "object" as const,
+            properties: Object.fromEntries(
+              tool.parameters.map((p) => [
+                p.name,
+                { type: p.type, description: p.description },
+              ]),
+            ),
+            required: tool.parameters
+              .filter((p) => p.required)
+              .map((p) => p.name),
+          },
         },
-      },
-    }));
+      }));
   }
 }
 
