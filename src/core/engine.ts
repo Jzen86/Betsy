@@ -4,6 +4,7 @@ import type { ToolRegistry } from "./tools/registry.js";
 import type { ToolResult } from "./tools/types.js";
 import { buildSystemPrompt, type PromptConfig } from "./prompt.js";
 import { searchKnowledge } from "./memory/knowledge.js";
+import { searchHistory, formatHistoryHits } from "./memory/history.js";
 import { saveMessage, loadHistory, extractText } from "./memory/conversations.js";
 import { compactHistory } from "./memory/compaction.js";
 import { LLMUnavailableError } from "./llm/router.js";
@@ -830,6 +831,23 @@ export class Engine {
       }
     } catch {
       // Memory not initialized yet — skip
+    }
+
+    // Автопоиск по истории: чтобы «пруфы» про прошлое не зависели от слова
+    // «помнишь». Роль угадываем по формулировке, всё остальное решает она:
+    // блок — кандидаты, а не приговор (владелец, 27.11.2026).
+    try {
+      const role: "me" | "you" | "any" = /(ты\s+(говорил|сказал|писала|обещала)|помнишь,?\s+ты)/i.test(userMessage)
+        ? "you"
+        : /(я\s+(говорил|сказал|писал)|помнишь,?\s+я)/i.test(userMessage)
+          ? "me"
+          : "any";
+      const res = searchHistory(userMessage, { role, days: 7, limit: 3, maxChars: 600 });
+      if (res.hits.length > 0) {
+        prompt += `\n\n## Из истории — возможные отсылки\n\nНайдено по словам из его сообщения. Если в ответе ссылаешься на прошлое — опирайся на найденное или ищи глубже через recall. Совпадение слова не значит «про то»: смысл проверяй сама.\n\n${formatHistoryHits(res, role)}`;
+      }
+    } catch {
+      // История недоступна — не повод ронять ход.
     }
 
     // Inject installed skills context
