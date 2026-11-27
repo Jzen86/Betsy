@@ -24,6 +24,7 @@ import type { Channel } from "./channels/types.js";
 import { sshTool } from "./core/tools/ssh.js";
 import { npmInstallTool } from "./core/tools/npm-install.js";
 import { ServerStatusTool } from "./core/tools/server-status.js";
+import { RecallTool } from "./core/tools/recall.js";
 import { RestartServiceTool } from "./core/tools/restart-service.js";
 import { SelfieTool } from "./core/tools/selfie.js";
 import { VoiceTool } from "./core/tools/voice.js";
@@ -130,6 +131,8 @@ async function main() {
   // подтверждение не нужно. Перезапуск — отдельный инструмент, только для двух
   // сервисов и только по флагу: это действие, а не наблюдение.
   tools.register(new ServerStatusTool());
+  // Память по истории: ищет по словам, отдаёт сообщения целиком, роль — его/её.
+  tools.register(new RecallTool());
   if (toolFlags.restart === true) tools.register(new RestartServiceTool());
   // channels map is populated later — closure captures the reference
   const channels = new Map<string, Channel>();
