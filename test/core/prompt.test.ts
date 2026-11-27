@@ -112,6 +112,14 @@ describe("buildSystemPrompt — режим companion", () => {
     expect(prompt).toContain("Мелочи о нём важнее выводов");
   });
 
+  it("держит роли: кто есть кто и как читать «нравится»", () => {
+    const prompt = buildSystemPrompt(companion);
+    expect(prompt).toContain("Кто есть кто");
+    expect(prompt).toContain("Ты не он и никогда не говоришь за него");
+    expect(prompt).toContain("«Женя нравится Еве» — чувство Евы");
+    expect(prompt).toContain("не выдавай желаемое за его признание");
+  });
+
   it("без флага режим остаётся ассистентским", () => {
     const prompt = buildSystemPrompt({ name: "Ева", personality: { tone: "t" } });
     expect(prompt).toContain("/settings");
