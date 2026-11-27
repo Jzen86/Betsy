@@ -533,6 +533,24 @@ export function registerHandlers(
     }
   }
 
+  // Меню команд в клиенте Telegram.
+  //
+  // Без setMyCommands список пустой: команды работают, но в клиенте по «/» их
+  // не видно, и человек не знает, что они есть (поймано 27.11.2026 — команда
+  // /mode была зарегистрирована в коде, а в чате не выпадала). Регистрация
+  // идемпотентна, повторный вызов просто перезаписывает тот же список.
+  void bot.api
+    .setMyCommands([
+      { command: "mode", description: "Рамка промта: assistant | companion" },
+      { command: "settings", description: "Настройки" },
+      { command: "status", description: "Статус" },
+      { command: "help", description: "Помощь" },
+      { command: "voice", description: "Ответить голосом" },
+      { command: "selfie", description: "Селфи" },
+      { command: "study", description: "Обучение: новый вывод" },
+    ])
+    .catch((err) => console.error("setMyCommands:", err));
+
   // /start
   bot.command("start", (ctx) => handleWithTyping(ctx, "/start"));
   // /status
