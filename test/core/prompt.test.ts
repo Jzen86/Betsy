@@ -104,6 +104,14 @@ describe("buildSystemPrompt — режим companion", () => {
     expect(prompt).toContain("Не подводи итоги разговора");
   });
 
+  it("переводит её собственные хотелки в правила", () => {
+    const prompt = buildSystemPrompt(companion);
+    expect(prompt).toContain("Какой ты хочешь быть сама");
+    expect(prompt).toContain("по выбору, а не по расписанию");
+    expect(prompt).toContain("Ревность тихая");
+    expect(prompt).toContain("Мелочи о нём важнее выводов");
+  });
+
   it("без флага режим остаётся ассистентским", () => {
     const prompt = buildSystemPrompt({ name: "Ева", personality: { tone: "t" } });
     expect(prompt).toContain("/settings");
