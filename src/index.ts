@@ -70,6 +70,11 @@ async function main() {
 
   console.log(`✅ Конфиг загружен: ${name}`);
 
+  // Рамка промта видна в бут-логе: /mode пишет конфиг и рестартит службу,
+  // и без этой строки нечем подтвердить, что рестарт подхватил новый режим.
+  const promptMode = config.agent?.mode ?? "assistant";
+  console.log(`🎭 Рамка промта: ${promptMode}`);
+
   // Setup LLM
   const apiKey = getLLMApiKey(config);
   let llm: LLMRouter | null = null;
