@@ -296,3 +296,23 @@
 - **Проверка.** Попросить селфи в живом разговоре, затем `journalctl -u betsy --since '10 min ago' | grep -E "engine:route|engine:inline_tool_calls|Selfie"`.
 
 Правка: агент (DeepSeek V4.1 Flash)
+
+## 2026-11-24 — разговорная ветка переключена на GLM-5.3 Flash (эксперимент)
+
+- **Что сделано.** BETSY_RP_MODEL живёт НЕ в самом юните, а в drop-in /etc/systemd/system/betsy.service.d/ipv4.conf (рядом с NODE_OPTIONS для IPv4). Там gemini-3.5-flash-lite заменён на пару BETSY_RP_PROVIDER=opencode + BETSY_RP_MODEL=glm-5.3-flash. Бэкап: ipv4.conf.bak-20261124-glm.
+- **Зачем.** Сравнить живость болталки на модели из подписки Go; заодно разговорные ходы перестают тарифицироваться в Google. Рабочая ветка (strong_model: glm-5.3-flash через providers.opencode) уже давно ходит этой же моделью — то есть проверяется только разговорный маршрут.
+- **Как проверять.** Короткая реплика без картинки → journalctl -u betsy --since '5 min ago' | grep engine:route должно дать "mode":"chat","model":"opencode/glm-5.3-flash". Длинный текст/картинки идут в TOOL — это норма, роутер не переключён.
+- **Откат.** cp /etc/systemd/system/betsy.service.d/ipv4.conf.bak-20261124-glm /etc/systemd/system/betsy.service.d/ipv4.conf && systemctl daemon-reload && systemctl restart betsy.
+- **Нюанс.** GLM-5.3 Flash отвечает с easoning_content — думает перед репликой, это лишние токены и задержка. В outer.ts easoning_effort: none ставится только для google и только не-lite. Если ветка останется, thinking для GLM надо гасить отдельно.
+- **Грабля на будущее.** systemctl cat показывает env из drop-in, а cat /etc/systemd/system/betsy.service — нет; поэтому правка юнита «по виду из cat» молча ничего не меняет. И drop-in с большим числом (99-...) НЕ перебивает переменную из ipv4.conf — править надо сам ipv4.conf.
+
+Правка: агент (DeepSeek V4.1 Flash)
+
+### 2026-11-24 — порог классификатора поднят до 1500 символов (BETSY_RP_MAX_CHARS)
+
+- **Что.** Порог, после которого сообщение вообще не классифицируется и уходит в рабочую ветку, вынесен в env BETSY_RP_MAX_CHARS (код: src/core/llm/chat-route.ts, коммит a4532c). На сервере в drop-in стоит 1500.
+- **Зачем.** При сравнении разговорных моделей владелец не может в голове считать 400 символов; его длинные реплики уходили в TOOL, и он оценивал deepseek вместо выбранной модели.
+- **Цена/риск.** Длинная задача теперь сначала идёт в дешёвый классификатор; если он ошибётся и скажет CHAT, инструменты у хода не будет. Промт классификатора по-прежнему смещает сомнение в TOOL, но за этим стоит следить.
+- **Откат.** Убрать Environment=BETSY_RP_MAX_CHARS=1500 из ipv4.conf + daemon-reload && restart (или поставить 400).
+
+Правка: агент (DeepSeek V4.1 Flash)
