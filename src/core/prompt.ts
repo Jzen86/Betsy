@@ -83,6 +83,42 @@ function opsNotesBlock(): string {
 }
 
 /**
+ * Персона компаньона из файла, который она сама может прочитать.
+ *
+ * Зачем файл, а не конфиг: владелец хочет править её текст там же, где она его
+ * видит (27.11.2026), и не ждать сборку. Конфиг остаётся запасным источником
+ * (`agent.companion_instructions`), а код — последним (`custom_instructions`),
+ * чтобы пустой или сломанный файл не оставил её без персоны.
+ *
+ * Границы: файл читается только целиком и только если он не подозрительно
+ * короткий (< 500 знаков). Это защита от обрезанной записи, а не от неё самой:
+ * запись в `~/.betsy/files` ей разрешена, и это осознанно — она может
+ * переписать свой текст. Цена: если она снесёт рамку, это увидят по логу
+ * «Персона компаньона: файл» и по первому же кривому ответу.
+ */
+const COMPANION_MIN_CHARS = 500;
+let companionSourceLogged = false;
+
+function companionPersona(config: PromptConfig): string | undefined {
+  const file = path.join(getConfigDir(), "files", "companion-prompt.md");
+  let fromFile: string | undefined;
+  try {
+    if (fs.existsSync(file)) {
+      const raw = fs.readFileSync(file, "utf8").trim();
+      if (raw.length >= COMPANION_MIN_CHARS) fromFile = raw;
+    }
+  } catch {
+    fromFile = undefined;
+  }
+  const text = fromFile ?? config.companionInstructions ?? config.personality?.customInstructions;
+  if (!companionSourceLogged) {
+    companionSourceLogged = true;
+    console.log(`🎭 Персона компаньона: ${fromFile ? file : "конфиг/код"}`);
+  }
+  return text;
+}
+
+/**
  * Промт режима `companion`.
  *
  * Чем отличается от ассистентского, по смыслу:
@@ -118,7 +154,7 @@ ${genderBlock}
   const personalityParts: string[] = [];
   if (config.personality?.tone) personalityParts.push(`Тон: ${config.personality.tone}`);
   if (config.personality?.responseStyle) personalityParts.push(`Стиль ответов: ${config.personality.responseStyle}`);
-  const personaText = config.companionInstructions ?? config.personality?.customInstructions;
+  const personaText = companionPersona(config);
   if (personaText) personalityParts.push(personaText);
   if (personalityParts.length > 0) {
     prompt += `\n\n## Личность\n\n${personalityParts.join("\n")}`;
