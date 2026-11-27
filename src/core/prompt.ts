@@ -151,9 +151,12 @@ ${genderBlock}
 
   // Персона: тон, стиль и текст характера. В companion режиме текст берётся
   // отдельный — продовый написан под «личного ассистента» и тянет назад.
+  // Стиль из конфига в компаньоне не подмешивается: там записано «3–4
+  // предложения… и зацепка», а рамка требует 1–4 и зацепку не по обязанности.
+  // Два источника длины и хвоста спорили между собой — оставлен один (рамка),
+  // иначе модель каждый ход выбирает, какому из них верить (замечено ею 27.11).
   const personalityParts: string[] = [];
   if (config.personality?.tone) personalityParts.push(`Тон: ${config.personality.tone}`);
-  if (config.personality?.responseStyle) personalityParts.push(`Стиль ответов: ${config.personality.responseStyle}`);
   const personaText = companionPersona(config);
   if (personaText) personalityParts.push(personaText);
   if (personalityParts.length > 0) {
