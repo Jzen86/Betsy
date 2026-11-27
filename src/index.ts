@@ -217,6 +217,8 @@ async function main() {
     config: {
       name,
       gender: config.agent?.gender ?? "female",
+      mode: config.agent?.mode ?? "assistant",
+      companionInstructions: config.agent?.companion_instructions,
       personality: {
         tone: personality.tone,
         responseStyle: personality.style,

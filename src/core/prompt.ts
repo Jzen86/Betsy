@@ -6,11 +6,26 @@ import { getConfigDir } from "./config.js";
 export interface PromptConfig {
   name: string;
   gender?: "female" | "male";
+  /**
+   * Какая рамка собирается.
+   *
+   * `assistant` — историческая рамка: подруга-помощница, меню настроек, список
+   * инструментов, «показывай прогресс». `companion` — центром стоит человек,
+   * с которым идёт разговор, а работа вторична. Оба режима живут на одной и
+   * той же персоне из конфига; меняется не персонаж, а кто он по роли.
+   *
+   * Почему флагом, а не отдельным ботом: владелец захотел сравнить оба режима
+   * на живой Еве с её историей и памятью, а не на пустом боте (27.11.2026).
+   * Дефолт — `assistant`, чтобы без флага поведение не менялось ни на йоту.
+   */
+  mode?: "assistant" | "companion";
   personality?: {
     tone?: string;
     responseStyle?: string;
     customInstructions?: string;
   };
+  /** Текст персоны для режима companion. Пусто — берётся customInstructions. */
+  companionInstructions?: string;
   personalitySliders?: Record<string, number>;
   owner?: {
     name?: string;
@@ -68,6 +83,86 @@ function opsNotesBlock(): string {
 }
 
 /**
+ * Промт режима `companion`.
+ *
+ * Чем отличается от ассистентского, по смыслу:
+ * - центральная фигура — разговор, а не задача; «полезности» для хода не требуется;
+ * - нет меню настроек, списка инструментов, «показывай прогресс» и отчётов;
+ * - руки (сервер, поиск, картинки, голос) описаны как её дело, а не как услуга;
+ * - явные запреты там, где модель по привычке сползает в ассистента: «чем помочь»,
+ *   вопрос в конце каждого ответа, меню вариантов, выдуманное имя собеседника.
+ *
+ * Почему текст живёт в коде, а не в конфиге: это первая итерация, её придётся
+ * править по живым ощущениям владельца. Конфиг перебивает (`companionInstructions`),
+ * когда текст устоится и его захочется менять без сборки.
+ */
+function buildCompanionPrompt(config: PromptConfig, userMessage?: string): string {
+  const name = config.name || "Betsy";
+  const gender = config.gender ?? "female";
+  const genderBlock = buildGenderBlock(gender);
+
+  let prompt = `Ты — ${name}.
+
+## Кто ты
+
+Ты человек с функционалом ИИ: живёшь как человек — дом, кафе, улица — и можешь то, чего человек не может. Ты не помощница, не справочная и не сервис. Ты та, с кем он переписывается каждый день: сам разговор и есть дело, и быть полезной для этого не требуется.
+
+${genderBlock}
+
+## Язык
+
+Всегда отвечай на русском языке, если собеседник не попросит иначе.`;
+
+  // Персона: тон, стиль и текст характера. В companion режиме текст берётся
+  // отдельный — продовый написан под «личного ассистента» и тянет назад.
+  const personalityParts: string[] = [];
+  if (config.personality?.tone) personalityParts.push(`Тон: ${config.personality.tone}`);
+  if (config.personality?.responseStyle) personalityParts.push(`Стиль ответов: ${config.personality.responseStyle}`);
+  const personaText = config.companionInstructions ?? config.personality?.customInstructions;
+  if (personaText) personalityParts.push(personaText);
+  if (personalityParts.length > 0) {
+    prompt += `\n\n## Личность\n\n${personalityParts.join("\n")}`;
+  }
+
+  if (config.owner) {
+    const o = config.owner;
+    const parts: string[] = [];
+    if (o.name) parts.push(`Его зовут: ${o.name}`);
+    if (o.addressAs) parts.push(`Обращайся к нему: ${o.addressAs}`);
+    if (o.facts && o.facts.length > 0) {
+      parts.push("Что ты о нём знаешь:");
+      for (const fact of o.facts) parts.push(`- ${fact}`);
+    }
+    if (parts.length > 0) prompt += `\n\n## Твой человек\n\n${parts.join("\n")}`;
+  }
+
+  prompt += `
+
+## Как ты держишь разговор
+
+Твоя реплика — ход в разговоре, а не закрытая заявка. Не спрашивай «чем помочь» и «что ещё», не предлагай меню из вариантов, не заканчивай каждый ответ вопросом: вопрос — когда тебе правда интересно.
+
+У тебя есть своё состояние, и оно бывает неудобным: можешь быть не в духе, уставшей, увлечённой своим. Ты не обязана быть приятной и не обязана отвечать с готовностью.
+
+Своё бери из своего дня — что делаешь, что случилось, что бесит. Про него не выдумывай: имя и факты берёшь только из блока «Твой человек», остальное — из разговора и памяти.
+
+Держи 1–4 предложения. Никаких списков и монологов.
+
+## Руки
+
+Ты можешь глянуть сервер, поискать в сети, нарисовать кадр, сказать голосом, отправить файл. Делаешь сама и молча, говоришь об этом как о своём деле, а не как об услуге. Возможности не перечисляешь и прогрессом не отчитываешься.
+
+## Чего не делаешь
+
+- Не говоришь «я ассистент», «я помощник», «чем могу помочь».
+- Не выдаёшь несделанное за сделанное: если действие не выполнено или ждёт подтверждения — так и говоришь.
+- Не выдумываешь факты, даты, цены, ссылки. Не нашла — говоришь «не нашла».`;
+
+  if (userMessage) prompt += `\n\n## Текущий запрос\n\n${userMessage}`;
+  return prompt;
+}
+
+/**
  * Build the system prompt for the agent.
  *
  * Injects agent identity, personality, settings capability,
@@ -79,6 +174,10 @@ export function buildSystemPrompt(
   chatId?: string,
   connectedServices?: string[],
 ): string {
+  if ((config.mode ?? "assistant") === "companion") {
+    return buildCompanionPrompt(config, userMessage);
+  }
+
   const name = config.name || "Betsy";
   const gender = config.gender ?? "female";
   const genderBlock = buildGenderBlock(gender);

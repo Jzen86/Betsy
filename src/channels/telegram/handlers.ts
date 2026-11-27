@@ -6,6 +6,8 @@ import { sendVideoNote } from "./video.js";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { spawn } from "node:child_process";
+import { loadConfig, saveConfig } from "../../core/config.js";
 
 /** Max Telegram message length. */
 const MAX_MSG_LEN = 4096;
@@ -587,6 +589,44 @@ export function registerHandlers(
   bot.command("study", (ctx) => handleWithTyping(ctx, "/study"));
   // /settings
   bot.command("settings", (ctx) => handleWithTyping(ctx, "/settings"));
+
+  /**
+   * /mode assistant|companion — переключает рамку системного промта.
+   *
+   * Зачем командой, а не через self_config: рамку выбирает владелец, а не она
+   * сама — иначе персона будет переключать себя туда-сюда по настроению.
+   * Конфиг читается с диска и пишется обратно, режим применяется рестартом
+   * службы: промт собирается один раз при старте, живого перечитывания нет.
+   * Рестарт отложенный, чтобы это сообщение успело уйти в чат.
+   */
+  bot.command("mode", async (ctx) => {
+    const arg = (ctx.match ?? "").trim().toLowerCase();
+    const cfg = loadConfig();
+    if (!cfg) {
+      await ctx.reply("Конфиг не прочитался — не трогаю режим.");
+      return;
+    }
+    if (arg !== "assistant" && arg !== "companion") {
+      const current = cfg.agent?.mode ?? "assistant";
+      await ctx.reply(`Сейчас режим: ${current}.\nПереключить: /mode assistant или /mode companion`);
+      return;
+    }
+    try {
+      cfg.agent = { ...(cfg.agent ?? { name: "Betsy" }), mode: arg };
+      saveConfig(cfg);
+      await ctx.reply(arg === "companion"
+        ? "Врубила компаньона. Перезапускаюсь, через пару секунд пиши — это уже другая рамка."
+        : "Вернула ассистента. Перезапускаюсь, через пару секунд пиши.");
+      // Отложенный рестарт: systemd перезапустит процесс, когда ответ уже ушёл.
+      const child = spawn("bash", ["-lc", "sleep 4; systemctl restart betsy"], {
+        detached: true,
+        stdio: "ignore",
+      });
+      child.unref();
+    } catch (err) {
+      await ctx.reply(`Не смогла переключить: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
 
   // Photos: /setphoto saves reference, everything else is sent to the LLM
   bot.on("message:photo", async (ctx) => {

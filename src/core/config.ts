@@ -56,7 +56,15 @@ const configSchema = z.object({
   agent: z.object({
     name: z.string().default("Betsy"),
     gender: z.enum(["female", "male"]).default("female"),
+    /**
+     * Рамка промта: `assistant` (историческая) или `companion` (разговор
+     * первичен, работа вторична). Переключается командой `/mode` в чате.
+     * Дефолт — assistant: без явного флага поведение не меняется.
+     */
+    mode: z.enum(["assistant", "companion"]).default("assistant"),
     personality: personalitySchema,
+    /** Текст персоны для режима companion. Пусто — берётся personality.*/
+    companion_instructions: z.string().optional(),
   }).default({ name: "Betsy" }),
 
   owner: z.object({

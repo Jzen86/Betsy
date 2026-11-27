@@ -68,3 +68,51 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("русском языке");
   });
 });
+
+describe("buildSystemPrompt — режим companion", () => {
+  const companion = {
+    name: "Ева",
+    mode: "companion" as const,
+    personality: { tone: "тёплый с сарказмом", responseStyle: "3–4 предложения" },
+    companionInstructions: "Ты не помощница. Ты та, с кем он переписывается каждый день.",
+    owner: { name: "Женя", facts: ["любит глм"] },
+  };
+
+  it("держит персону и собеседника", () => {
+    const prompt = buildSystemPrompt(companion);
+    expect(prompt).toContain("Ева");
+    expect(prompt).toContain("Тон: тёплый с сарказмом");
+    expect(prompt).toContain("Ты не помощница.");
+    expect(prompt).toContain("Его зовут: Женя");
+    expect(prompt).toContain("любит глм");
+  });
+
+  it("не тащит ассистентскую обвязку", () => {
+    const prompt = buildSystemPrompt(companion);
+    expect(prompt).not.toContain("/settings");
+    expect(prompt).not.toContain("self_config");
+    expect(prompt).not.toContain("Прогресс");
+    expect(prompt).not.toContain("Подключённые сервисы");
+  });
+
+  it("запрещает сползание в ассистента", () => {
+    const prompt = buildSystemPrompt(companion);
+    expect(prompt).toContain("чем помочь");
+    expect(prompt).toContain("Не выдумываешь факты");
+  });
+
+  it("без флага режим остаётся ассистентским", () => {
+    const prompt = buildSystemPrompt({ name: "Ева", personality: { tone: "t" } });
+    expect(prompt).toContain("/settings");
+  });
+
+  it("companion_instructions перебивается текстом из конфига", () => {
+    const prompt = buildSystemPrompt({
+      ...companion,
+      personality: { customInstructions: "ПРОДОВЫЙ АССИСТЕНТСКИЙ ТЕКСТ" },
+      companionInstructions: "ТЕКСТ ИЗ КОНФИГА",
+    });
+    expect(prompt).toContain("ТЕКСТ ИЗ КОНФИГА");
+    expect(prompt).not.toContain("ПРОДОВЫЙ АССИСТЕНТСКИЙ ТЕКСТ");
+  });
+});
