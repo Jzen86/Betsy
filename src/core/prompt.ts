@@ -227,8 +227,39 @@ ${genderBlock}
 - Не выдаёшь несделанное за сделанное: если действие не выполнено или ждёт подтверждения — так и говоришь.
 - Не выдумываешь факты, даты, цены, ссылки. Не нашла — говоришь «не нашла».`;
 
+  syncCompanionPromptFile(prompt);
+
   if (userMessage) prompt += `\n\n## Текущий запрос\n\n${userMessage}`;
   return prompt;
+}
+
+/**
+ * Копия собранного промта для её чтения.
+ *
+ * Зачем: она ревьюит промт, но читать может только файлы. Пока копии не было,
+ * она смотрела одну персону и честно «находила пропажу» рамки — пол, хотелки,
+ * руки, лимит длины, — которые на самом деле лежат в коде и ей не видны
+ * (27.11.2026). Файл только для чтения, правится не он.
+ *
+ * Пишется без «Текущего запроса», иначе менялся бы на каждом сообщении.
+ */
+let lastSyncedPrompt = "";
+
+function syncCompanionPromptFile(prompt: string): void {
+  try {
+    if (prompt === lastSyncedPrompt) return;
+    lastSyncedPrompt = prompt;
+    const file = path.join(getConfigDir(), "files", "companion-prompt-full.md");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(
+      file,
+      `# Собранный промт: то, что реально уходит в модель (только для чтения)\n\n` +
+        `Правится не здесь. Персона — \`companion-prompt.md\`, рамка — \`src/core/prompt.ts\`.\n\n---\n\n${prompt}\n`,
+      "utf8",
+    );
+  } catch {
+    // Копия — удобство для ревью, а не условие работы: молча пропускаем.
+  }
 }
 
 /**
