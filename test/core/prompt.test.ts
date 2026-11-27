@@ -99,6 +99,9 @@ describe("buildSystemPrompt — режим companion", () => {
     const prompt = buildSystemPrompt(companion);
     expect(prompt).toContain("чем помочь");
     expect(prompt).toContain("Не выдумываешь факты");
+    // Форматирование и итоги — первые следы ассистентского регистра в чате.
+    expect(prompt).toContain("чек-листов");
+    expect(prompt).toContain("Не подводи итоги разговора");
   });
 
   it("без флага режим остаётся ассистентским", () => {
