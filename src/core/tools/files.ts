@@ -74,7 +74,7 @@ export class FilesTool implements Tool {
       return { success: false, output: "", error: "Этот файл закрыт: конфиг, ключи и база не читаются." }
     }
     try {
-      const data = await readFile(path, "utf-8")
+      const data = await readFile(expand(path), "utf-8")
       return { success: true, output: data }
     } catch (err) {
       return { success: false, output: "", error: (err as Error).message }
@@ -94,7 +94,7 @@ export class FilesTool implements Tool {
     }
     await mkdir(nodePath.dirname(nodePath.resolve(expand(path))), { recursive: true }).catch(() => {})
     try {
-      await writeFile(path, content, "utf-8")
+      await writeFile(expand(path), content, "utf-8")
       return { success: true, output: `Written to ${path}` }
     } catch (err) {
       return { success: false, output: "", error: (err as Error).message }
@@ -119,7 +119,7 @@ export class FilesTool implements Tool {
     }
     await mkdir(nodePath.dirname(nodePath.resolve(expand(path))), { recursive: true }).catch(() => {})
     try {
-      await appendFile(path, content, "utf-8")
+      await appendFile(expand(path), content, "utf-8")
       return { success: true, output: `Appended to ${path}` }
     } catch (err) {
       return { success: false, output: "", error: (err as Error).message }
@@ -127,10 +127,12 @@ export class FilesTool implements Tool {
   }
 
   private async list(path: string): Promise<ToolResult> {    try {
-      const entries = await readdir(path)
+      const entries = await readdir(expand(path))
       return { success: true, output: entries.join("\n") }
     } catch (err) {
       return { success: false, output: "", error: (err as Error).message }
     }
   }
 }
+
+

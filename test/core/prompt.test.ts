@@ -90,9 +90,9 @@ describe("buildSystemPrompt — режим companion", () => {
   it("не тащит ассистентскую обвязку", () => {
     const prompt = buildSystemPrompt(companion);
     expect(prompt).not.toContain("/settings");
-    expect(prompt).not.toContain("self_config");
     expect(prompt).not.toContain("Прогресс");
     expect(prompt).not.toContain("Подключённые сервисы");
+    expect(prompt).not.toContain("Навыки (скиллы)");
   });
 
   it("запрещает сползание в ассистента", () => {
