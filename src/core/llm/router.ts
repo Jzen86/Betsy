@@ -219,12 +219,13 @@ export class LLMRouter {
     }
 
     // Google's «thinking» models тратят на размышления тот же бюджет, что и на
-    // ответ, и без явного нуля отвечают коротко и поздно. Но у `*-lite` такого
-    // параметра нет — запрос с ним отбивается 400, поэтому только для не-lite.
-    // Проверено живьём на gemini-3.5-flash-lite (23.11): `reasoning_effort: none`
-    // → «Request contains an invalid argument».
-    const extraBody =
-      provider === "google" && !/lite/i.test(model) ? { reasoning_effort: "none" } : undefined;
+    // ответ, и без явного нуля отвечают коротко и поздно. Но параметр есть не у
+    // всех: `gemini-3.5-*‑lite` и **Gemma** отвечают на него 400
+    // (`Thinking budget is not supported for this model`, проверено 28.11 —
+    // именно это роняло разговорный маршрут на gemma-4-26b). Поэтому только
+    // для Gemini, у которых мышление есть.
+    const supportsThinkingOff = provider === "google" && /gemini-/i.test(model) && !/lite/i.test(model);
+    const extraBody = supportsThinkingOff ? { reasoning_effort: "none" } : undefined;
 
     return createCompatClient({
       apiKey,
