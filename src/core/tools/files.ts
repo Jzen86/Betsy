@@ -77,6 +77,22 @@ export class FilesTool implements Tool {
       const data = await readFile(expand(path), "utf-8")
       return { success: true, output: data }
     } catch (err) {
+      /**
+       * Голое имя — это её кладовая.
+       *
+       * Живой случай 28.11: она зовёт `who-i-am.md`, файл лежит в
+       * `~/.betsy/files`, а относительный путь разрешался от каталога процесса
+       * и падал с ENOENT. Поэтому если каталога в пути нет — пробуем кладовую,
+       * прежде чем вернуть ошибку.
+       */
+      if (!path.includes("/") && !path.includes("\\")) {
+        try {
+          const data = await readFile(nodePath.join(VAULT, path), "utf-8")
+          return { success: true, output: data }
+        } catch {
+          // ниже вернём исходную ошибку — она точнее для настоящего пути
+        }
+      }
       return { success: false, output: "", error: (err as Error).message }
     }
   }
