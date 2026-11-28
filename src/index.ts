@@ -12,6 +12,7 @@ import { FilesTool } from "./core/tools/files.js";
 import { HttpTool } from "./core/tools/http.js";
 import { BrowserTool } from "./core/tools/browser.js";
 import { WebTool } from "./core/tools/web.js";
+import { WebSearchTool } from "./core/tools/web-search.js";
 import { memoryTool } from "./core/tools/memory.js";
 import { selfConfigTool } from "./core/tools/self-config.js";
 import { SchedulerService } from "./core/tools/scheduler.js";
@@ -210,6 +211,12 @@ async function main() {
   if (skillsmpKey) {
     tools.register(new SkillSearchTool({ apiKey: skillsmpKey }));
     tools.register(new SkillInstallTool({ apiKey: llmApiKey ?? undefined }));
+  }
+  // Поиск в сети по запросу. Ключ Brave — в конфиге, не в коде: до 28.11 она
+  // «искала», дёргая поисковик через http, и с сервера ловила капчу.
+  const braveKey = (config as any).brave?.api_key as string | undefined;
+  if (braveKey) {
+    tools.register(new WebSearchTool({ apiKey: braveKey }));
   }
   // Web tool — conditional on google config
   const googleConfig = (config as any).google as { api_key: string; cx: string } | undefined;
