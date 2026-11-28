@@ -89,6 +89,24 @@ export function toOpenAIMessages(
 }
 
 /**
+ * Рассуждения Gemma приходят прямо в текст ответа.
+ *
+ * OpenAI-совместимый слой Гугла не отделяет `<thought>` от реплики: у Gemma
+ * размышления лежат в `content` перед ответом. Живой случай 28.11 — в чат
+ * ушёл внутренний разбор комплимента списком («Комплимент смутил и попал в
+ * точку…»), потому что движок принял мысли за ответ. Поэтому теги срезаем
+ * здесь, на входе в общий разбор ответа, а не в каждом месте отдельно.
+ */
+export function stripThoughts(text: string): string {
+  if (!text) return text;
+  let out = text.replace(/<thought>[\s\S]*?<\/thought>/gi, "");
+  // Незакрытый блок — модель оборвалась внутри мыслей: дальше реплики нет.
+  out = out.replace(/<thought>[\s\S]*$/i, "");
+  out = out.replace(/<\/?thought>/gi, "");
+  return out.trim();
+}
+
+/**
  * Причина остановки без `finish_reason` — это обрыв, а не ответ.
  *
  * Живой случай (23.11): провайдер закрыл поток на середине слова, финального
@@ -103,9 +121,16 @@ export function buildResponse(
   toolCalls?: Array<{ id: string; name: string; arguments: Record<string, unknown> }>,
   usage?: { prompt_tokens: number; completion_tokens: number },
 ): LLMResponse {
+  const cleaned = stripThoughts(content);
+  // Ответ состоял только из мыслей — это не реплика: движок должен переспросить,
+  // а не отправлять человеку внутренний монолог.
+  const thoughtsOnly = content.trim().length > 0 && cleaned.length === 0;
+
   let stopReason: LLMResponse["stopReason"];
   if (toolCalls?.length || finishReason === "tool_calls" || finishReason === "function_call") {
     stopReason = "tool_use";
+  } else if (thoughtsOnly) {
+    stopReason = "incomplete";
   } else if (finishReason === "length") {
     stopReason = "max_tokens";
   } else if (finishReason === "content_filter") {
@@ -117,7 +142,7 @@ export function buildResponse(
   }
 
   return {
-    text: content,
+    text: cleaned,
     toolCalls: toolCalls?.length ? toolCalls : undefined,
     stopReason,
     usage: usage
