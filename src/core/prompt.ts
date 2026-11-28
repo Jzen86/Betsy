@@ -177,6 +177,31 @@ const MOMENT_BY_PERIOD: Record<string, { mood: string[]; doing: string[]; want: 
 
 let lastMoment: string[] = [];
 
+/** Время в Саратове — её собственные часы, а не серверные. */
+export function buildClock(): string {
+  const now = new Date();
+  try {
+    const parts = new Intl.DateTimeFormat("ru-RU", {
+      timeZone: "Europe/Saratov",
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(now);
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    const weekday = get("weekday");
+    const day = get("day");
+    const month = get("month");
+    const hour = get("hour");
+    const minute = get("minute");
+    return `Сейчас ${weekday}, ${day} ${month}, ${hour}:${minute} (Саратов).`;
+  } catch {
+    return `Сейчас ${now.getHours()}:${String(now.getMinutes()).padStart(2, "0")}.`;
+  }
+}
+
 function saratovHour(): number {
   try {
     return Number(
@@ -351,7 +376,7 @@ ${genderBlock}
   // Состояние момента — после копии, чтобы файл-описание не переписывался
   // каждый ход: состояние принадлежит ходу, а не её тексту о себе. И перед
   // «Текущим запросом», чтобы оно было ближе к концу и сильнее красило ответ.
-  prompt += `\n\n## Сейчас\n\n${buildMomentState()}`;
+  prompt += `\n\n## Сейчас\n\n${buildClock()}\n\n${buildMomentState()}`;
 
   if (userMessage) prompt += `\n\n## Текущий запрос\n\n${userMessage}`;
   return prompt;
