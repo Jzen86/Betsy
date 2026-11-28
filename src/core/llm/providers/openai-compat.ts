@@ -162,11 +162,23 @@ export function createCompatClient(opts: CompatOptions): LLMClient {
     defaultHeaders: opts.headers,
   });
 
+  /**
+   * `tool`-сообщения допустимы только вместе с описанием инструментов.
+   *
+   * Google-слой отвечает 400 `function_response.name: Cannot find field`, если
+   * в истории остался ответ инструмента, а `tools` в запросе не передан
+   * (проверено 28.11: тот же запрос без `tools` → 400, с пустым `assistant` → 200).
+   * Так бывает на запасном пути: история с вызовами уходит в модель, которой
+   * инструменты не дают. Поэтому чистим историю не только по явному
+   * `stripTools`, но и всякий раз, когда инструментов в запросе нет.
+   */
+  const strip = (tools?: ToolDefinition[]): boolean => opts.stripTools === true || !(tools && tools.length > 0);
+
   return {
     async chat(messages: LLMMessage[], tools?: ToolDefinition[]): Promise<LLMResponse> {
       const arg = {
         model: opts.model,
-        messages: toOpenAIMessages(messages, opts.stripTools),
+        messages: toOpenAIMessages(messages, strip(tools)),
         ...(tools?.length ? { tools } : {}),
         ...(opts.extraBody ?? {}),
       };
@@ -205,7 +217,7 @@ export function createCompatClient(opts: CompatOptions): LLMClient {
     ): Promise<LLMResponse> {
       const arg = {
         model: opts.model,
-        messages: toOpenAIMessages(messages, opts.stripTools),
+        messages: toOpenAIMessages(messages, strip(tools)),
         ...(tools?.length ? { tools } : {}),
         ...(opts.extraBody ?? {}),
         stream: true,
